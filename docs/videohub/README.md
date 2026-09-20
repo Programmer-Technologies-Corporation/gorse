@@ -212,11 +212,11 @@ Structures that scale with the catalog, with their bounds on this branch:
 | Structure                                  | Size driver                                   | Bound / control                                              |
 |--------------------------------------------|-----------------------------------------------|--------------------------------------------------------------|
 | master dataset (items, labels, feedback)   | items × labels, positive feedback             | `recommend.data_source.item_ttl`, `positive_feedback_ttl`    |
-| CTR training set embeddings (BF16)         | items × dim × 2 B                             | one embedding column, `embedding_dimensions`                 |
+| CTR training set embeddings (FP16)         | items × dim × 2 B                             | one embedding column, `embedding_dimensions`                 |
 | item-to-item vector collections (`xvec`)   | items × dim × 4 B per embedding recommender   | one vector per item, reported by `vector_store_estimated_bytes` |
 | collaborative filtering collections        | items × factors × 4 B, two generations kept   | upstream keeps the two newest complete models                |
 | Redis documents                            | see section 2                                 | `recommend.cache_size`, `cache_documents_total`              |
-| worker item cache                          | candidates touched in one cycle               | freed after each cycle; embeddings compressed to BF16        |
+| worker item cache                          | candidates touched in one cycle               | freed after each cycle; embeddings compressed to FP16        |
 | API responses                              | `n` per request                               | `[videohub].max_query_n`                                     |
 
 Operational guidance:
