@@ -33,7 +33,7 @@ import (
 
 	"github.com/expr-lang/expr"
 	"github.com/expr-lang/expr/vm"
-	"github.com/gorse-io/gorse/common/bfloats"
+	"github.com/gorse-io/gorse/common/floats"
 	"github.com/gorse-io/gorse/config"
 	"github.com/gorse-io/gorse/storage"
 	"github.com/gorse-io/gorse/storage/cache"
@@ -63,7 +63,7 @@ func compileItemColumn(column string) (*vm.Program, error) {
 // ItemEmbedding evaluates the embedding column of an embedding-based
 // item-to-item recommender for one item. present reports whether the column
 // holds a value; err reports a value that is present but is not a numeric
-// vector. Values are rounded through BF16 exactly like the master job so the
+// vector. Values are rounded through FP16 exactly like the master job so the
 // incrementally indexed vector equals the one the periodic job would write.
 func ItemEmbedding(cfg config.ItemToItemConfig, item *data.Item) (embedding []float32, present bool, err error) {
 	if cfg.Type != "embedding" {
@@ -89,12 +89,12 @@ func ItemEmbedding(cfg config.ItemToItemConfig, item *data.Item) (embedding []fl
 	if len(values) == 0 {
 		return nil, false, nil
 	}
-	return bfloats.ToFloat32(bfloats.FromFloat32(values)), true, nil
+	return floats.ToFloat32(floats.FromFloat32(values)), true, nil
 }
 
 // toFloat32Slice converts the label representations produced by the REST
 // layer (json.Number elements), by the data stores (float64 elements) and by
-// Go callers ([]float32, []float64, BF16 []uint16) into a float32 vector.
+// Go callers ([]float32, []float64, FP16 []uint16) into a float32 vector.
 func toFloat32Slice(v any) ([]float32, bool) {
 	switch typed := v.(type) {
 	case []float32:
@@ -106,7 +106,7 @@ func toFloat32Slice(v any) ([]float32, bool) {
 		}
 		return values, true
 	case []uint16:
-		return bfloats.ToFloat32(typed), true
+		return floats.ToFloat32(typed), true
 	case []any:
 		values := make([]float32, len(typed))
 		for i, element := range typed {
@@ -118,11 +118,11 @@ func toFloat32Slice(v any) ([]float32, bool) {
 				values[i] = float32(f)
 				continue
 			}
-			converted, ok := bfloats.FromAny([]any{element})
+			converted, ok := floats.FromAny([]any{element})
 			if !ok || len(converted) != 1 {
 				return nil, false
 			}
-			values[i] = bfloats.ToFloat32(converted)[0]
+			values[i] = floats.ToFloat32(converted)[0]
 		}
 		return values, true
 	}
@@ -130,11 +130,11 @@ func toFloat32Slice(v any) ([]float32, bool) {
 	if rv.Kind() != reflect.Slice {
 		return nil, false
 	}
-	converted, ok := bfloats.FromAny(v)
+	converted, ok := floats.FromAny(v)
 	if !ok {
 		return nil, false
 	}
-	return bfloats.ToFloat32(converted), true
+	return floats.ToFloat32(converted), true
 }
 
 // IndexItemVector upserts the embedding-based item-to-item vector of an item.
