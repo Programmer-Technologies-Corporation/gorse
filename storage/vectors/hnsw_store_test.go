@@ -583,6 +583,9 @@ func TestHNSWSearchDoesNotAllocate(t *testing.T) {
 		index.search(scratch, query, 10, 100, nil)
 	})
 	require.Zero(t, allocations)
+	if raceDetector {
+		return
+	}
 	allocations = testing.AllocsPerRun(50, func() {
 		index.add(query, nil)
 	})
