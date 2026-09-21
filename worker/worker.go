@@ -215,7 +215,7 @@ func (w *Worker) Sync() {
 
 		// connect to vector store
 		if w.vectorPath != w.Config.Database.VectorStore || w.vectorPrefix != w.Config.Database.VectorTablePrefix {
-			if strings.HasPrefix(w.Config.Database.VectorStore, storage.XvecPrefix) {
+			if storage.IsEmbeddedVectorStore(w.Config.Database.VectorStore) {
 				log.Logger().Info("connect vector store via master")
 				w.vectorStore = vectors.NewProxyClient(w.conn)
 			} else {

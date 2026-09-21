@@ -27,6 +27,9 @@ data_store = "mysql://gorse:gorse_pass@tcp(localhost:3306)/gorse"
 
 # The database for vector indices, support xvec, Qdrant, Weaviate and Milvus:
 #   xvec://<path>
+#   hnsw://<path>[?m=32&ef_construction=200&ef_search=100&precision=auto]
+#     VideoHub fork: persistent, incrementally updated HNSW index owned by the
+#     master, see docs/videohub/README.md.
 #   qdrant://<host>:<port>
 #   weaviate://<host>:<port>
 #   weaviates://<host>:<port>
