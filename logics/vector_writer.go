@@ -129,6 +129,15 @@ func (w *VectorWriter) Clean() error {
 	if err := w.client.DeleteVectors(w.ctx, w.collection, w.timestamp); err != nil && !errors.Is(err, storage.ErrNotFound) {
 		return errors.WithStack(err)
 	}
+	// VideoHub fork: nothing ever called Optimize. An embedded store needs it
+	// once per cycle: xvec only drops superseded rows and persists its index
+	// there (without it every query after a write rebuilds the index and the
+	// collection grows until it refuses writes), hnsw snapshots and compacts.
+	// Remote backends implement it as a no-op.
+	if err := w.client.Optimize(w.ctx, w.collection); err != nil && !errors.Is(err, storage.ErrNotFound) {
+		log.Logger().Warn("failed to optimize similarity vector collection",
+			zap.String("collection", w.collection), zap.Error(err))
+	}
 	return nil
 }
 
