@@ -6,20 +6,28 @@ files, hooks into upstream code are a few lines each, and every behavioural
 change is opt-in through the `[videohub]` config section. Panic boundaries and
 metrics are always on because they only add safety and observability.
 
-## Branch layout and rebasing
+## Branch layout and syncing with upstream
 
 | Branch     | Purpose                                                     |
 |------------|-------------------------------------------------------------|
 | `master`   | mirror of upstream `master`, never carries VideoHub commits |
-| `videohub` | upstream `master` + the commits described here              |
+| `videohub` | upstream commits + the commits described here               |
 
-To pick up upstream changes:
+The repository's ruleset requires linear history and forbids force pushes on
+every branch, so `videohub` can neither merge upstream nor be rebased onto it.
+Upstream commits are cherry-picked instead, with `-x` so each one names the
+upstream commit it came from, on a topic branch that is merged into `videohub`
+with **Rebase and merge** (a squash would fold upstream's commits into one).
+
+Last upstream commit picked: `be5934c` (feat: pass FP16 embeddings to GoMLX, #1379).
 
 ```bash
 git fetch upstream
 git checkout master && git merge --ff-only upstream/master && git push origin master
-git checkout videohub && git rebase master   # or: git merge master
-go build ./... && go test ./config/ ./logics/ ./server/ ./worker/ ./master/ ./model/ctr/ ./storage/cache/
+git checkout -b sync-upstream videohub
+git cherry-pick -x <last upstream commit picked>..upstream/master
+go build ./... && go test ./config/ ./logics/ ./server/ ./worker/ ./master/ ./model/ctr/ ./storage/... ./common/floats/
+# update "Last upstream commit picked" above, push, open a PR into videohub
 ```
 
 Files that are entirely ours (no merge conflicts expected):
