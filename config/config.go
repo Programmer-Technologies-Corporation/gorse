@@ -963,6 +963,7 @@ func (config *Config) Validate() error {
 	if err := validate.RegisterValidation("vector_store", func(fl validator.FieldLevel) bool {
 		prefixes := []string{
 			storage.XvecPrefix,
+			storage.HNSWPrefix, // VideoHub fork
 			storage.QdrantPrefix,
 			storage.WeaviatePrefix,
 			storage.WeaviatesPrefix,

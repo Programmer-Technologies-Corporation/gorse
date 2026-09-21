@@ -31,6 +31,8 @@ Files that are entirely ours (no merge conflicts expected):
 - `master/guard.go`
 - `model/ctr/metrics.go`
 - `storage/cache/redis_memory.go`
+- `storage/scheme_videohub.go`, `storage/vectors/hnsw_*.go` (the `hnsw://` vector store)
+- `common/floats/floats_videohub.go` (allocation-free FP16 helpers)
 
 Small hooks into upstream files (each a few lines, marked with a
 "VideoHub fork" comment where the intent is not obvious):
@@ -49,6 +51,8 @@ Small hooks into upstream files (each a few lines, marked with a
 - `logics/item_to_item.go`: missing collection means "no neighbors"; no error log per item without labels or an embedding.
 - `logics/vector_writer.go`: `appendSparseVector` drops repeated ids (a user with several feedback types on one item made the vector store reject the user-to-user vector with "duplicate coordinate").
 - `storage/cache/redis.go`: the document scan skips hashes deleted while scanning instead of failing garbage collection.
+- `config/config.go`: `hnsw://` accepted by the `vector_store` validator.
+- `server/server.go`, `worker/worker.go`: `storage.IsEmbeddedVectorStore` decides whether the vector store is reached through the master (it was a check for the `xvec://` prefix).
 
 ## Configuration
 
@@ -213,7 +217,7 @@ Structures that scale with the catalog, with their bounds on this branch:
 |--------------------------------------------|-----------------------------------------------|--------------------------------------------------------------|
 | master dataset (items, labels, feedback)   | items × labels, positive feedback             | `recommend.data_source.item_ttl`, `positive_feedback_ttl`    |
 | CTR training set embeddings (FP16)         | items × dim × 2 B                             | one embedding column, `embedding_dimensions`                 |
-| item-to-item vector collections (`xvec`)   | items × dim × 4 B per embedding recommender   | one vector per item, reported by `vector_store_estimated_bytes` |
+| item-to-item vector collections            | `hnsw://`: items × (2 × dim + 4 × M0 + 120) B, see section 7; `xvec://` holds several copies on the heap | one vector per item, `gorse_vector_index_memory_bytes` |
 | collaborative filtering collections        | items × factors × 4 B, two generations kept   | upstream keeps the two newest complete models                |
 | Redis documents                            | see section 2                                 | `recommend.cache_size`, `cache_documents_total`              |
 | worker item cache                          | candidates touched in one cycle               | freed after each cycle; embeddings compressed to FP16        |
@@ -231,3 +235,125 @@ Operational guidance:
 - Item quotas (`[quota]`) exist upstream and are the hard cap on catalog growth;
   `max_items_count` is the right knob if ingestion should stop rather than
   grow memory.
+
+## 7. Neighbor computation: the `hnsw://` vector store
+
+Upstream `master` already moved item-to-item, user-to-user and collaborative
+filtering search out of the in-memory HNSW (`common/ann`, now unused outside
+tests) and into the vector store, which for an embedded deployment is `xvec`.
+Reading `xvec` at the pinned version showed that it cannot serve Gorse's write
+pattern:
+
+- every upsert appends a new row and a tombstone, even for an identical
+  document, and nothing is ever compacted because Gorse never calls `Flush` or
+  `Optimize`; a collection stops accepting writes at 10 M retained rows;
+- the first query after **any** write rebuilds the whole DiskANN index (Vamana
+  graph plus product quantizer training) over every retained row, dead versions
+  included, while holding the collection lock. The fork's incremental item
+  indexing (section 3) turns every item insert into such a rebuild;
+- documents, the decoded snapshot and the index all live on the Go heap, and a
+  filtered query allocates per row before the graph search starts.
+
+Measured with `GORSE_VECTOR_BENCH=100000 go test ./storage/vectors -run TestVectorStoreCycle -v`
+(100 k vectors, 256 dimensions, one core, Windows/amd64):
+
+| Step                              | `xvec://`            | `hnsw://`          |
+|-----------------------------------|----------------------|--------------------|
+| first cycle (load)                | 2.9 s, 2.8 GB alloc  | 17.7 s, 0.4 GB     |
+| first query                       | 7.9 s, 4.4 GB alloc  | < 1 ms             |
+| 1000 queries                      | 51.9 s, 118 GB alloc | 0.12 s, 2 MB alloc |
+| next cycle, nothing changed       | 7.7 s, 6.8 GB alloc  | 0.09 s             |
+| first query after that cycle      | 19.2 s, 8.9 GB alloc | < 1 ms             |
+| one item upsert + one query       | 19.4 s, 8.9 GB alloc | 1 ms               |
+| live heap after two cycles        | 1.1 GB               | ~90 MB             |
+
+`hnsw://` is a vector store written for that pattern. It is selected by URL, so
+`xvec://` keeps working and switching back is a one line change:
+
+```toml
+[database]
+vector_store = "hnsw:///var/lib/gorse/master/hnsw"
+```
+
+What it does:
+
+- **Incremental cycles.** One persistent HNSW graph per dense collection. An
+  upsert whose vector is bit-identical only refreshes the timestamp; a change of
+  `hidden` or categories is an in-place metadata update; only a changed vector
+  is re-linked (new slot, old slot becomes a tombstone that still routes
+  searches). `DeleteVectors` tombstones what the cycle did not touch. The cycle
+  over an unchanged catalog is a comparison per item.
+- **Compaction instead of rebuilds.** When tombstones pass `compact_ratio`
+  (default 20 % of the slots, at least 1024) the graph is rebuilt in the
+  background from a frozen prefix of the slabs; writes that arrive meanwhile are
+  replayed before the swap. Queries and writes keep running. This is the only
+  time a whole graph is built after the first load. Changing `m`, `m0` or
+  `ef_construction` triggers the same rebuild.
+- **FP16 storage.** Gorse hands embeddings over already rounded to FP16, so a
+  collection whose first batch survives an FP16 round trip is stored as FP16
+  (half the memory, and faster than FP32 here because distance evaluation is
+  memory bound). Anything else (collaborative filtering factors) stays FP32.
+  `precision=fp16|fp32` overrides the choice.
+- **Graph parameters.** `M = 32`, `M0 = 64`, `ef_construction = 200`,
+  `ef_search = 100`, with the HNSW neighbor selection heuristic instead of the
+  plain "closest M" of `common/ann`. On embedding-like data recall@10 is 1.00 at
+  `M = 32` and still 0.999 at `M = 16`; the old index (`M = 48`, no heuristic)
+  reaches 0.994 while being 4.7x slower per query. `BenchmarkHNSWQuery` compares
+  `M` and precision.
+- **No allocation in searches.** A pooled scratch per index holds an
+  epoch-marked `[]uint32` visited array, two typed binary heaps and the decode
+  buffers. `TestHNSWSearchDoesNotAllocate` pins 0 allocations per search; the
+  old `searchLayer` allocated about 107 KB per query.
+- **SIMD distances without square roots.** Every metric is one SIMD dot product
+  (`floats.Dot`, FP16 decoded by the SIMD `floats.ToFloat32To`): squared
+  Euclidean distance is `|a|^2 + |q|^2 - 2a.q` with both norms precomputed. The
+  score returned for Euclidean collections stays the negated squared distance,
+  the same contract as the `xvec` backend, so `1 / (1 + d^2)` API scores do not
+  change.
+- **Inner product collections** (collaborative filtering) are indexed through
+  the usual reduction to nearest neighbor search (one extra coordinate
+  `sqrt(phi^2 - |v|^2)` on stored vectors); queries still rank by plain inner
+  product. It lifts recall@10 on a hard synthetic set from 0.64 to 0.85.
+- **Filters.** Category sets are interned, a filter is evaluated once per set
+  instead of once per vector, and filters that match fewer than `scan_min`
+  (4096) vectors or less than `scan_ratio` (5 %) are answered by an exact scan
+  of the matches instead of walking the graph past everything they reject.
+- **Sparse collections** (tag and feedback similarity) use an exact inverted
+  index. Their vectors change every cycle because IDF weights move, so they are
+  compacted in place, which is linear.
+- **Persistence.** One snapshot file per collection
+  (`<root>/<collection>/index.bin`, CRC32, written to a temporary file and
+  renamed). Snapshots are taken when a collection changed and has been quiet for
+  two seconds, every `snapshot_interval` (1 m), on `Optimize` and on `Close`.
+  Timestamp-only changes are not worth a snapshot. A crash loses the writes
+  since the last snapshot; the next master cycle restores them because it diffs
+  against the store, and the fork's embedding fallback (section 3) covers the
+  gap for new items. A snapshot that fails its checksum is logged, counted and
+  started empty instead of keeping the master from starting.
+
+Options (URL query): `m`, `m0`, `ef_construction`, `ef_search`, `precision`,
+`snapshot_interval`, `compact_ratio`, `scan_ratio`, `scan_min`.
+
+Metrics (master `/metrics`):
+
+| Metric | Meaning |
+|---|---|
+| `gorse_vector_index_vectors{collection}` | live vectors |
+| `gorse_vector_index_tombstones{collection}` | vectors awaiting compaction |
+| `gorse_vector_index_memory_bytes{collection}` | estimated heap of the collection |
+| `gorse_vector_index_upserts_total{collection,outcome}` | `inserted`, `replaced`, `metadata`, `unchanged`: the share of `unchanged` is what a cycle saved |
+| `gorse_vector_index_deletes_total{collection}` | vectors a cycle no longer produced |
+| `gorse_vector_index_compactions_total`, `_compaction_seconds` | graph rebuilds |
+| `gorse_vector_index_snapshot_seconds`, `_snapshot_bytes`, `_snapshot_failures_total` | persistence |
+| `gorse_vector_index_load_failures_total{collection}` | snapshots rejected at startup |
+| `gorse_vector_index_query_seconds{mode}` | latency by `graph`, `scan`, `inverted` |
+
+Sizing: a dense FP16 collection costs about `items x (2 x dim + 4 x M0 + 120)`
+bytes, 0.76 KB per item at 256 dimensions, so roughly 76 MB per 100 k items, plus
+the same again while a compaction or a snapshot copy is in flight.
+
+Migration from `xvec://`: point `vector_store` at a new directory and restart
+the master. The store starts empty; the first item-to-item and user-to-user
+cycle fills it and the next collaborative filtering fit recreates its
+collection. Until then neighbors come from the embedding fallback. The old
+`xvec` directory is not touched and can be removed once the switch has settled.
