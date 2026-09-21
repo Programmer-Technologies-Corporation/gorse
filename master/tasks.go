@@ -992,6 +992,11 @@ func (m *Master) trainCollaborativeFiltering(parent context.Context, trainSet, t
 		}
 		indexSpan.Add(end - start)
 	}
+	// VideoHub fork: seal the collection, see VectorWriter.Clean.
+	if err := m.VectorClient.Optimize(indexCtx, collection); err != nil {
+		log.Logger().Warn("failed to optimize collaborative filtering collection",
+			zap.String("collection", collection), zap.Error(err))
+	}
 	indexSpan.End()
 	span.Add(1)
 

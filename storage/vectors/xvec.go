@@ -104,7 +104,7 @@ func (db *Xvec) Init() error {
 		if name == "" {
 			continue
 		}
-		collection, err := xvec.Open(context.Background(), filepath.Join(db.root, entry.Name()), xvec.CollectionOptions{})
+		collection, err := xvec.Open(context.Background(), filepath.Join(db.root, entry.Name()), xvec.NewCollectionOptions())
 		if err != nil {
 			cleanup()
 			return errors.WithStack(err)
@@ -207,7 +207,9 @@ func (db *Xvec) AddCollection(ctx context.Context, name string, dimensions int, 
 	if _, found := db.collections.Load(name); found {
 		return fmt.Errorf("collection %s %w", name, storage.ErrAlreadyExists)
 	}
-	collection, err := xvec.CreateAndOpen(ctx, filepath.Join(db.root, physicalName), schema, xvec.CollectionOptions{})
+	// VideoHub fork: the zero CollectionOptions leave mmap off, so flushed index
+	// artifacts were read into the heap. The setting is persisted per collection.
+	collection, err := xvec.CreateAndOpen(ctx, filepath.Join(db.root, physicalName), schema, xvec.NewCollectionOptions())
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -398,7 +400,9 @@ func (db *Xvec) QueryVectors(ctx context.Context, name string, q Vector, categor
 		Filter: filter,
 		Projection: xvec.Projection{
 			OutputFields:   []string{xvecCategoriesField, xvecTimestampField, xvecHiddenField},
-			IncludeVectors: true,
+			// VideoHub fork: no caller reads the vectors of a result; decoding
+			// them (and shipping them through the master proxy) was pure cost.
+			IncludeVectors: false,
 		},
 	}
 	if len(q.Indices) > 0 {

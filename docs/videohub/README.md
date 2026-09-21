@@ -60,6 +60,8 @@ Small hooks into upstream files (each a few lines, marked with a
 - `logics/vector_writer.go`: `appendSparseVector` drops repeated ids (a user with several feedback types on one item made the vector store reject the user-to-user vector with "duplicate coordinate").
 - `storage/cache/redis.go`: the document scan skips hashes deleted while scanning instead of failing garbage collection.
 - `config/config.go`: `hnsw://` accepted by the `vector_store` validator.
+- `logics/vector_writer.go` (`Clean`) and `master/tasks.go` (collaborative filtering index): call `Optimize` once the collection is written.
+- `storage/vectors/xvec.go`: `xvec.NewCollectionOptions()` instead of the zero options (mmap), query results without vectors.
 - `server/server.go`, `worker/worker.go`: `storage.IsEmbeddedVectorStore` decides whether the vector store is reached through the master (it was a check for the `xvec://` prefix).
 
 ## Configuration
@@ -338,6 +340,33 @@ What it does:
   against the store, and the fork's embedding fallback (section 3) covers the
   gap for new items. A snapshot that fails its checksum is logged, counted and
   started empty instead of keeping the master from starting.
+
+### The `xvec://` fallback
+
+Three fixes keep upstream's store usable as a fallback. They do not make it
+competitive, the numbers below are 20 k vectors on xvec `0f0a064` (2026-09-21),
+which behaves like the pinned version in this benchmark:
+
+- **`Optimize` after every cycle.** Upstream never calls it, and every remote
+  backend implements it as a no-op, so it was clearly meant for xvec. Without
+  it the writing segment is never sealed: each query after a write rebuilds the
+  index (2.6 s, 1.5 GB allocated) and dead rows pile up until the 10 M row
+  limit. With it the index is built once per cycle (2.3 s), superseded rows are
+  dropped (live heap 228 MB -> 102 MB) and a single upsert followed by a query
+  only rebuilds the small writing segment (82 ms).
+- **`xvec.NewCollectionOptions()`.** The zero `CollectionOptions` get the 64 MiB
+  buffer from normalization but leave `EnableMmap` false, so sealed index
+  artifacts were read into the heap. The flag is persisted in the collection
+  manifest: collections created before this change keep mmap off until they are
+  recreated. It only matters together with `Optimize`, nothing was ever sealed
+  before.
+- **No vectors in query results.** No caller reads them; decoding them and
+  sending them through the master's gRPC proxy was pure cost.
+
+What remains and cannot be fixed from Gorse: every filtered query (Gorse always
+filters on `hidden = false`) forward-scans all rows and allocates about 24 MB at
+20 k vectors (8.9 ms per query against 0.07 ms on `hnsw://`), documents stay on
+the heap in any case, and `Optimize` is a full rewrite plus index build.
 
 Options (URL query): `m`, `m0`, `ef_construction`, `ef_search`, `precision`,
 `snapshot_interval`, `compact_ratio`, `scan_ratio`, `scan_min`.
