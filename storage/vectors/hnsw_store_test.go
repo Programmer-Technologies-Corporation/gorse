@@ -540,6 +540,44 @@ func TestHNSWFilteredSearch(t *testing.T) {
 	}
 }
 
+// The master hands over FP16 bits (HValues); an FP16 index stores them as
+// they are and treats the same bits as unchanged on the next cycle.
+func TestHNSWNativeFP16Vectors(t *testing.T) {
+	log.SetTestLogger(t)
+	ctx := context.Background()
+	const n, dim, k = 2000, 32, 10
+	data := fp16Vectors(9, n, dim, 10)
+	db := openHNSW(t, t.TempDir(), "")
+	defer db.Close()
+	require.NoError(t, db.AddCollection(ctx, "c", dim, Euclidean, VectorConfig{}))
+	batch := make([]Vector, n)
+	for i := range batch {
+		batch[i] = Vector{Id: fmt.Sprintf("item-%d", i), HValues: floats.FromFloat32(data[i]), Timestamp: time.Now()}
+	}
+	require.NoError(t, db.AddVectors(ctx, "c", batch))
+	collection, err := db.collection("c")
+	require.NoError(t, err)
+	require.True(t, collection.dense.fp16)
+	require.NoError(t, db.AddVectors(ctx, "c", batch))
+	require.Equal(t, n, collection.totalSlots(), "same bits, nothing re-linked")
+	require.NoError(t, db.AddVectors(ctx, "c", toVectors(data[:n/2], time.Now(), nil)))
+	require.Equal(t, n, collection.totalSlots(), "FP32 values of the same vectors are unchanged too")
+
+	var total float64
+	for i := 0; i < 40; i++ {
+		query := data[i*13]
+		results, err := db.QueryVectors(ctx, "c", Vector{HValues: floats.FromFloat32(query)}, nil, k)
+		require.NoError(t, err)
+		require.Equal(t, fmt.Sprintf("item-%d", i*13), results[0].Id)
+		total += recall(exactNeighbors(data, query, k, Euclidean, nil), results)
+	}
+	require.GreaterOrEqual(t, total/40, 0.97)
+	stored, err := db.GetVectors(ctx, "c", []string{"item-1"})
+	require.NoError(t, err)
+	require.Equal(t, data[1], stored[0].Values)
+	require.Error(t, db.AddVectors(ctx, "c", []Vector{{Id: "nan", HValues: append(make([]uint16, dim-1), 0x7e00)}}))
+}
+
 func TestHNSWSparseMatchesExactScores(t *testing.T) {
 	ctx := context.Background()
 	rng := rand.New(rand.NewSource(7))
