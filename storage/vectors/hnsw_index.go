@@ -305,13 +305,17 @@ func (x *denseIndex) appendVector(v []float32) int32 {
 	} else {
 		x.vec32 = append(x.vec32, v...)
 	}
+	x.appendSlotMeta(slot)
+	return slot
+}
+
+// appendSlotMeta computes the norm of the vector just stored in slot and
+// allocates its link storage.
+func (x *denseIndex) appendSlotMeta(slot int32) {
 	// Norms are taken from the stored precision so that the distance of a
 	// vector to itself is exactly zero.
 	s := x.getScratch()
-	stored := v
-	if x.fp16 {
-		stored = x.vector(s.decode, slot)
-	}
+	stored := x.vector(s.decode, slot)
 	norm := x.queryNorm(stored)
 	if x.distance == Dot {
 		norm = 0
@@ -325,13 +329,25 @@ func (x *denseIndex) appendVector(v []float32) int32 {
 	x.links0 = append(x.links0, make([]int32, x.params.M0)...)
 	x.count0 = append(x.count0, 0)
 	x.upper = append(x.upper, nil)
-	return slot
 }
 
 // add stores a vector and links it into the graph. accept limits which slots
 // the new node links to (tombstones stay reachable but gain no new links).
 func (x *denseIndex) add(v []float32, accept slotAcceptor) int32 {
 	slot := x.appendVector(v)
+	x.link(slot, accept)
+	return slot
+}
+
+// addVector stores a Vector that may carry FP16 bits (HValues). Bits go into
+// an FP16 index without a conversion; anything else takes the FP32 path.
+func (x *denseIndex) addVector(v Vector, accept slotAcceptor) int32 {
+	if len(v.HValues) == 0 || !x.fp16 {
+		return x.add(v.Float32Values(), accept)
+	}
+	slot := int32(len(x.levels))
+	x.vec16 = append(x.vec16, v.HValues...)
+	x.appendSlotMeta(slot)
 	x.link(slot, accept)
 	return slot
 }

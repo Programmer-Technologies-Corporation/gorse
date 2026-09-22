@@ -772,8 +772,16 @@ func (c *hnswCollection) bytesLocked() int64 {
 }
 
 func validateDense(vector Vector, dim int) error {
-	if len(vector.Indices) != 0 || len(vector.Values) != dim {
-		return errors.Errorf("vector %s has dimension %d, collection expects %d", vector.Id, len(vector.Values), dim)
+	if vector.IsSparse() || vector.Len() != dim {
+		return errors.Errorf("vector %s has dimension %d, collection expects %d", vector.Id, vector.Len(), dim)
+	}
+	if len(vector.HValues) > 0 {
+		for _, bits := range vector.HValues {
+			if bits&0x7c00 == 0x7c00 { // FP16 exponent all ones: Inf or NaN
+				return errors.Errorf("vector %s contains a non-finite value", vector.Id)
+			}
+		}
+		return nil
 	}
 	for _, value := range vector.Values {
 		if math.IsNaN(float64(value)) || math.IsInf(float64(value), 0) {
@@ -822,7 +830,8 @@ func normalizeSparse(vector Vector) ([]uint32, []float32, error) {
 func maxNorm(vectors []Vector) float32 {
 	var largest float32
 	for _, vector := range vectors {
-		largest = max(largest, floats.Dot(vector.Values, vector.Values))
+		values := vector.Float32Values()
+		largest = max(largest, floats.Dot(values, values))
 	}
 	return float32(math.Sqrt(float64(largest)))
 }
@@ -832,6 +841,9 @@ func losslessFP16(vectors []Vector) bool {
 	var encoded []uint16
 	var decoded []float32
 	for _, vector := range vectors {
+		if len(vector.HValues) > 0 {
+			continue // already FP16 bits
+		}
 		if cap(encoded) < len(vector.Values) {
 			encoded, decoded = make([]uint16, len(vector.Values)), make([]float32, len(vector.Values))
 		}
@@ -894,7 +906,7 @@ func (c *hnswCollection) upsert(ctx context.Context, vectors []Vector) error {
 		same := false
 		if exists {
 			if c.dim > 0 {
-				same = c.sameDense(slot, vector.Values, &encoded)
+				same = c.sameDense(slot, vector, &encoded)
 			} else {
 				same = c.sparse.equal(slot, normalized[i].indices, normalized[i].values)
 			}
@@ -922,7 +934,7 @@ func (c *hnswCollection) upsert(ctx context.Context, vectors []Vector) error {
 				inserted++
 			}
 			if c.dim > 0 {
-				c.dense.add(vector.Values, liveAcceptor{c.meta})
+				c.dense.addVector(vector, liveAcceptor{c.meta})
 			} else {
 				c.sparse.add(normalized[i].indices, normalized[i].values)
 			}
@@ -940,29 +952,27 @@ func (c *hnswCollection) upsert(ctx context.Context, vectors []Vector) error {
 	return nil
 }
 
-func (c *hnswCollection) sameDense(slot int32, values []float32, encoded *[]uint16) bool {
+func (c *hnswCollection) sameDense(slot int32, vector Vector, encoded *[]uint16) bool {
 	offset := int(slot) * c.dim
 	if !c.dense.fp16 {
 		stored := c.dense.vec32[offset : offset+c.dim]
-		for i, value := range values {
+		for i, value := range vector.Float32Values() {
 			if math.Float32bits(stored[i]) != math.Float32bits(value) {
 				return false
 			}
 		}
 		return true
 	}
-	if cap(*encoded) < c.dim {
-		*encoded = make([]uint16, c.dim)
-	}
-	*encoded = (*encoded)[:c.dim]
-	floats.FromFloat32To(*encoded, values)
-	stored := c.dense.vec16[offset : offset+c.dim]
-	for i, value := range *encoded {
-		if stored[i] != value {
-			return false
+	bits := vector.HValues
+	if len(bits) == 0 {
+		if cap(*encoded) < c.dim {
+			*encoded = make([]uint16, c.dim)
 		}
+		*encoded = (*encoded)[:c.dim]
+		floats.FromFloat32To(*encoded, vector.Values)
+		bits = *encoded
 	}
-	return true
+	return slices.Equal(c.dense.vec16[offset:offset+c.dim], bits)
 }
 
 func (c *hnswCollection) deleteBefore(timestamp time.Time) {
@@ -1016,8 +1026,8 @@ func (c *hnswCollection) query(q Vector, categories []string, topK int) ([]Score
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	if c.dim > 0 {
-		if len(q.Indices) != 0 || len(q.Values) != c.dim {
-			return nil, errors.Errorf("query has dimension %d, collection %s expects %d", len(q.Values), c.name, c.dim)
+		if q.IsSparse() || q.Len() != c.dim {
+			return nil, errors.Errorf("query has dimension %d, collection %s expects %d", q.Len(), c.name, c.dim)
 		}
 	} else if len(q.Indices) == 0 || len(q.Indices) != len(q.Values) {
 		return nil, errors.Errorf("collection %s expects a sparse query", c.name)
@@ -1051,11 +1061,16 @@ func (c *hnswCollection) query(q Vector, categories []string, topK int) ([]Score
 		}
 		accept := &queryAcceptor{meta: c.meta, match: match}
 		k := min(topK, matching)
+		values := q.Values
+		if len(q.HValues) > 0 {
+			values = s.query[:c.dim]
+			floats.ToFloat32To(values, q.HValues)
+		}
 		if matching < c.opts.scanMin || float64(matching) < c.opts.scanRatio*float64(c.totalSlots()) {
 			mode = "scan"
-			found = c.dense.scan(s, q.Values, k, accept)
+			found = c.dense.scan(s, values, k, accept)
 		} else {
-			found = c.dense.search(s, q.Values, k, max(c.opts.params.EFSearch, k), accept)
+			found = c.dense.search(s, values, k, max(c.opts.params.EFSearch, k), accept)
 		}
 	}
 

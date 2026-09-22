@@ -151,14 +151,14 @@ func (e *embeddingItemToItem) Add(item *data.Item, _ []int32) error {
 	}
 	return e.VectorWriter.Add(vectors.Vector{
 		Id:         item.ItemId,
-		Values:     embedding,
+		HValues:    embedding,
 		IsHidden:   item.IsHidden,
 		Categories: item.Categories,
 		Timestamp:  e.timestamp,
 	})
 }
 
-func ExtractItemEmbedding(item *data.Item, columnFunc *vm.Program) ([]float32, bool) {
+func ExtractItemEmbedding(item *data.Item, columnFunc *vm.Program) ([]uint16, bool) {
 	if item.Labels == nil {
 		return nil, false
 	}
@@ -177,7 +177,7 @@ func ExtractItemEmbedding(item *data.Item, columnFunc *vm.Program) ([]float32, b
 		log.Logger().Error("failed to convert column to FP16 slice", zap.Any("column", result))
 		return nil, false
 	}
-	return floats.ToFloat32(v), true
+	return v, true
 }
 
 type tagsItemToItem struct {
