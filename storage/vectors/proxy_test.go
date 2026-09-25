@@ -18,8 +18,10 @@ import (
 	"fmt"
 	"net"
 	"testing"
+	"time"
 
 	"github.com/gorse-io/gorse/common/log"
+	"github.com/gorse-io/gorse/storage"
 	"github.com/stretchr/testify/suite"
 	"google.golang.org/grpc"
 )
@@ -58,4 +60,20 @@ func (suite *ProxyTestSuite) TearDownSuite() {
 
 func TestProxy(t *testing.T) {
 	suite.Run(t, new(ProxyTestSuite))
+}
+
+// VideoHub fork: sentinel errors survive the gRPC hop for every method, not
+// only DescribeCollection.
+func (suite *ProxyTestSuite) TestSentinelErrors() {
+	ctx := suite.T().Context()
+	_, err := suite.Database.GetVectors(ctx, "missing", []string{"a"})
+	suite.ErrorIs(err, storage.ErrNotFound)
+	_, err = suite.Database.QueryVectors(ctx, "missing", Vector{Values: make([]float32, defaultVectorSize)}, nil, 1)
+	suite.ErrorIs(err, storage.ErrNotFound)
+	_, err = suite.Database.CountVectors(ctx, "missing")
+	suite.ErrorIs(err, storage.ErrNotFound)
+	suite.ErrorIs(suite.Database.DeleteVectors(ctx, "missing", time.Now()), storage.ErrNotFound)
+	suite.ErrorIs(suite.Database.DeleteCollection(ctx, "missing"), storage.ErrNotFound)
+	suite.NoError(suite.Database.AddCollection(ctx, "dup", defaultVectorSize, Cosine, VectorConfig{}))
+	suite.ErrorIs(suite.Database.AddCollection(ctx, "dup", defaultVectorSize, Cosine, VectorConfig{}), storage.ErrAlreadyExists)
 }
