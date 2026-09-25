@@ -460,12 +460,16 @@ func (w *Worker) Serve() {
 	}
 }
 
-// pushProgress reports the tracer's spans to the master.
+// pushProgress reports the tracer's spans to the master. It runs on the
+// recommendation loop, so the RPC is bounded by the cluster meta timeout
+// instead of being allowed to stall the next cycle.
 func (w *Worker) pushProgress() {
 	if w.masterClient == nil {
 		return
 	}
-	if _, err := w.masterClient.PushProgress(context.Background(), monitor.EncodeProgress(w.Tracer.List())); err != nil {
+	ctx, cancel := context.WithTimeout(context.Background(), w.Config.Master.MetaTimeout)
+	defer cancel()
+	if _, err := w.masterClient.PushProgress(ctx, monitor.EncodeProgress(w.Tracer.List())); err != nil {
 		log.Logger().Error("failed to report update task", zap.Error(err))
 	}
 }
