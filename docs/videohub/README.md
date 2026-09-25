@@ -50,7 +50,8 @@ Small hooks into upstream files (each a few lines, marked with a
   `modifyItem`, `queryItemToItem` in `SearchItemToItem`.
 - `worker/pipeline.go`: per-user `recoverUserJob`, outcome counters, `safeBatchPredict`
   and the degrade-to-unranked fallback when ranking fails.
-- `worker/worker.go`: model id gauges when a model is pulled.
+- `worker/worker.go`: model id gauges when a model is pulled; `pushProgress` after every recommendation cycle (upstream only reported from a 10 s ticker inside the cycle, so the dashboard showed the last long cycle as "Running" forever).
+- `storage/vectors/proxy.go`: `toStatus`/`fromStatus` carry `storage.ErrNotFound`, `ErrAlreadyExists` and `ErrNotSupported` through gRPC for every method (only `DescribeCollection` did), so a not-yet-built collection means "no neighbors" on worker and server too.
 - `master/tasks.go`: every task step wrapped in `runTask`, item-to-item stats,
   malformed embedding count, cache document counts in `collectGarbage`, model id gauges.
 - `master/master.go`: model id gauges when meta is loaded at startup.

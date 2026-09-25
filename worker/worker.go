@@ -438,12 +438,12 @@ func (w *Worker) Serve() {
 			log.Logger().Info("ranking recommendation",
 				zap.Int("n_complete_users", completed),
 				zap.Int("throughput", throughput))
-			if w.masterClient != nil {
-				if _, err := w.masterClient.PushProgress(context.Background(), monitor.EncodeProgress(w.Tracer.List())); err != nil {
-					log.Logger().Error("failed to report update task", zap.Error(err))
-				}
-			}
+			w.pushProgress()
 		})
+		// VideoHub fork: the callback above only fires from a 10 s ticker, so a
+		// cycle that finished (or one that never took 10 s) was never reported
+		// and the dashboard kept showing the last snapshot as "Running".
+		w.pushProgress()
 	}
 
 	for {
@@ -457,6 +457,16 @@ func (w *Worker) Serve() {
 		case <-w.pulledChan:
 			loop()
 		}
+	}
+}
+
+// pushProgress reports the tracer's spans to the master.
+func (w *Worker) pushProgress() {
+	if w.masterClient == nil {
+		return
+	}
+	if _, err := w.masterClient.PushProgress(context.Background(), monitor.EncodeProgress(w.Tracer.List())); err != nil {
+		log.Logger().Error("failed to report update task", zap.Error(err))
 	}
 }
 

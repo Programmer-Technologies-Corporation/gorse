@@ -52,7 +52,7 @@ func (p *ProxyServer) Stop() {
 func (p *ProxyServer) ListCollections(ctx context.Context, _ *protocol.ListCollectionsRequest) (*protocol.ListCollectionsResponse, error) {
 	collections, err := p.database.ListCollections(ctx)
 	if err != nil {
-		return nil, err
+		return nil, toStatus(err)
 	}
 	return &protocol.ListCollectionsResponse{Collections: collections}, nil
 }
@@ -60,14 +60,11 @@ func (p *ProxyServer) ListCollections(ctx context.Context, _ *protocol.ListColle
 func (p *ProxyServer) DescribeCollection(ctx context.Context, request *protocol.DescribeCollectionRequest) (*protocol.DescribeCollectionResponse, error) {
 	info, err := p.database.DescribeCollection(ctx, request.GetName())
 	if err != nil {
-		if errors.Is(err, storage.ErrNotFound) {
-			return nil, status.Error(codes.NotFound, err.Error())
-		}
-		return nil, err
+		return nil, toStatus(err)
 	}
 	distance, err := distanceToProtoDistance(info.Distance)
 	if err != nil {
-		return nil, err
+		return nil, toStatus(err)
 	}
 	return &protocol.DescribeCollectionResponse{
 		Name:       info.Name,
@@ -83,12 +80,12 @@ func (p *ProxyServer) DescribeCollection(ctx context.Context, request *protocol.
 func (p *ProxyServer) AddCollection(ctx context.Context, request *protocol.AddCollectionRequest) (*protocol.AddCollectionResponse, error) {
 	distance, err := protoDistanceToDistance(request.GetDistance())
 	if err != nil {
-		return nil, err
+		return nil, toStatus(err)
 	}
 	config := protoVectorConfigToVectorConfig(request.GetConfig())
 	err = p.database.AddCollection(ctx, request.GetName(), int(request.GetDimensions()), distance, config)
 	if err != nil {
-		return nil, err
+		return nil, toStatus(err)
 	}
 	return &protocol.AddCollectionResponse{}, nil
 }
@@ -96,7 +93,7 @@ func (p *ProxyServer) AddCollection(ctx context.Context, request *protocol.AddCo
 func (p *ProxyServer) DeleteCollection(ctx context.Context, request *protocol.DeleteCollectionRequest) (*protocol.DeleteCollectionResponse, error) {
 	err := p.database.DeleteCollection(ctx, request.GetName())
 	if err != nil {
-		return nil, err
+		return nil, toStatus(err)
 	}
 	return &protocol.DeleteCollectionResponse{}, nil
 }
@@ -104,7 +101,7 @@ func (p *ProxyServer) DeleteCollection(ctx context.Context, request *protocol.De
 func (p *ProxyServer) CountVectors(ctx context.Context, request *protocol.CountVectorsRequest) (*protocol.CountVectorsResponse, error) {
 	count, err := p.database.CountVectors(ctx, request.GetCollection())
 	if err != nil {
-		return nil, err
+		return nil, toStatus(err)
 	}
 	return &protocol.CountVectorsResponse{Count: count}, nil
 }
@@ -128,7 +125,7 @@ func (p *ProxyServer) AddVectors(ctx context.Context, request *protocol.AddVecto
 	}
 	err := p.database.AddVectors(ctx, request.GetCollection(), vectors)
 	if err != nil {
-		return nil, err
+		return nil, toStatus(err)
 	}
 	return &protocol.AddVectorsResponse{}, nil
 }
@@ -136,7 +133,7 @@ func (p *ProxyServer) AddVectors(ctx context.Context, request *protocol.AddVecto
 func (p *ProxyServer) GetVectors(ctx context.Context, request *protocol.GetVectorsRequest) (*protocol.GetVectorsResponse, error) {
 	vectors, err := p.database.GetVectors(ctx, request.GetCollection(), request.GetIds())
 	if err != nil {
-		return nil, err
+		return nil, toStatus(err)
 	}
 	pbVectors := make([]*protocol.Vector, len(vectors))
 	for i, vector := range vectors {
@@ -160,7 +157,7 @@ func (p *ProxyServer) DeleteVectors(ctx context.Context, request *protocol.Delet
 	}
 	err := p.database.DeleteVectors(ctx, request.GetCollection(), timestamp)
 	if err != nil {
-		return nil, err
+		return nil, toStatus(err)
 	}
 	return &protocol.DeleteVectorsResponse{}, nil
 }
@@ -173,7 +170,7 @@ func (p *ProxyServer) QueryVectors(ctx context.Context, request *protocol.QueryV
 		Indices: query.GetIndices(),
 	}, request.GetCategories(), int(request.GetTopK()))
 	if err != nil {
-		return nil, err
+		return nil, toStatus(err)
 	}
 	pbVectors := make([]*protocol.ScoredVector, len(results))
 	for i, result := range results {
@@ -217,7 +214,7 @@ func (p ProxyClient) Close() error {
 func (p ProxyClient) ListCollections(ctx context.Context) ([]string, error) {
 	resp, err := p.VectorStoreClient.ListCollections(ctx, &protocol.ListCollectionsRequest{})
 	if err != nil {
-		return nil, err
+		return nil, fromStatus(err)
 	}
 	return resp.Collections, nil
 }
@@ -225,14 +222,11 @@ func (p ProxyClient) ListCollections(ctx context.Context) ([]string, error) {
 func (p ProxyClient) DescribeCollection(ctx context.Context, name string) (*CollectionInfo, error) {
 	resp, err := p.VectorStoreClient.DescribeCollection(ctx, &protocol.DescribeCollectionRequest{Name: name})
 	if err != nil {
-		if status.Code(err) == codes.NotFound {
-			return nil, fmt.Errorf("collection %s: %w", name, storage.ErrNotFound)
-		}
-		return nil, err
+		return nil, fromStatus(err)
 	}
 	distance, err := protoDistanceToDistance(resp.GetDistance())
 	if err != nil {
-		return nil, err
+		return nil, fromStatus(err)
 	}
 	config := VectorConfig{}
 	if resp.GetConfig() != nil {
@@ -250,7 +244,7 @@ func (p ProxyClient) DescribeCollection(ctx context.Context, name string) (*Coll
 func (p ProxyClient) AddCollection(ctx context.Context, name string, dimensions int, distance Distance, config VectorConfig) error {
 	pbDistance, err := distanceToProtoDistance(distance)
 	if err != nil {
-		return err
+		return fromStatus(err)
 	}
 	_, err = p.VectorStoreClient.AddCollection(ctx, &protocol.AddCollectionRequest{
 		Name:       name,
@@ -258,18 +252,18 @@ func (p ProxyClient) AddCollection(ctx context.Context, name string, dimensions 
 		Distance:   pbDistance,
 		Config:     vectorConfigToProtoVectorConfig(config),
 	})
-	return err
+	return fromStatus(err)
 }
 
 func (p ProxyClient) DeleteCollection(ctx context.Context, name string) error {
 	_, err := p.VectorStoreClient.DeleteCollection(ctx, &protocol.DeleteCollectionRequest{Name: name})
-	return err
+	return fromStatus(err)
 }
 
 func (p ProxyClient) CountVectors(ctx context.Context, collection string) (int64, error) {
 	resp, err := p.VectorStoreClient.CountVectors(ctx, &protocol.CountVectorsRequest{Collection: collection})
 	if err != nil {
-		return 0, err
+		return 0, fromStatus(err)
 	}
 	return resp.GetCount(), nil
 }
@@ -291,7 +285,7 @@ func (p ProxyClient) AddVectors(ctx context.Context, collection string, vectors 
 		Collection: collection,
 		Vectors:    pbVectors,
 	})
-	return err
+	return fromStatus(err)
 }
 
 func (p ProxyClient) GetVectors(ctx context.Context, collection string, ids []string) ([]Vector, error) {
@@ -300,7 +294,7 @@ func (p ProxyClient) GetVectors(ctx context.Context, collection string, ids []st
 		Ids:        ids,
 	})
 	if err != nil {
-		return nil, err
+		return nil, fromStatus(err)
 	}
 	vectors := make([]Vector, len(resp.GetVectors()))
 	for i, vector := range resp.GetVectors() {
@@ -326,7 +320,7 @@ func (p ProxyClient) DeleteVectors(ctx context.Context, collection string, times
 		Collection: collection,
 		Timestamp:  timestamppb.New(timestamp),
 	})
-	return err
+	return fromStatus(err)
 }
 
 func (p ProxyClient) QueryVectors(ctx context.Context, collection string, q Vector, categories []string, topK int) ([]ScoredVector, error) {
@@ -341,7 +335,7 @@ func (p ProxyClient) QueryVectors(ctx context.Context, collection string, q Vect
 		TopK:       int32(topK),
 	})
 	if err != nil {
-		return nil, err
+		return nil, fromStatus(err)
 	}
 	results := make([]ScoredVector, len(resp.Vectors))
 	for i, scored := range resp.Vectors {
@@ -402,4 +396,41 @@ func protoVectorConfigToVectorConfig(config *protocol.VectorConfig) VectorConfig
 	vectorConfig.Type = QuantizationType(config.GetQuantizationType())
 	vectorConfig.Bits = int(config.GetQuantizationBits())
 	return vectorConfig
+}
+
+// VideoHub fork: storage sentinel errors must survive the hop through gRPC.
+// Callers test errors.Is(err, storage.ErrNotFound) (a recommender whose
+// collection has not been built yet answers "no neighbors"), which failed on
+// the worker and server because the proxy only translated DescribeCollection.
+
+// toStatus maps a storage error to a gRPC status.
+func toStatus(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, storage.ErrNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, storage.ErrAlreadyExists):
+		return status.Error(codes.AlreadyExists, err.Error())
+	case errors.Is(err, storage.ErrNotSupported):
+		return status.Error(codes.Unimplemented, err.Error())
+	default:
+		return err
+	}
+}
+
+// fromStatus maps a gRPC status back to the storage error it came from.
+func fromStatus(err error) error {
+	switch status.Code(err) {
+	case codes.OK:
+		return nil
+	case codes.NotFound:
+		return fmt.Errorf("%s: %w", status.Convert(err).Message(), storage.ErrNotFound)
+	case codes.AlreadyExists:
+		return fmt.Errorf("%s: %w", status.Convert(err).Message(), storage.ErrAlreadyExists)
+	case codes.Unimplemented:
+		return fmt.Errorf("%s: %w", status.Convert(err).Message(), storage.ErrNotSupported)
+	default:
+		return err
+	}
 }
