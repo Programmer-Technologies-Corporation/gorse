@@ -19,7 +19,7 @@ Upstream commits are cherry-picked instead, with `-x` so each one names the
 upstream commit it came from, on a topic branch that is merged into `videohub`
 with **Rebase and merge** (a squash would fold upstream's commits into one).
 
-Last upstream commit picked: `be5934c` (feat: pass FP16 embeddings to GoMLX, #1379).
+Last upstream commit picked: `bc8ca79` (test: stabilize neural network training, #1386).
 
 ```bash
 git fetch upstream
