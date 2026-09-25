@@ -58,6 +58,7 @@ import (
 
 const (
 	hnswSnapshotFile      = "index.bin"
+	hnswPreviousSnapshot  = "index.bin.old"
 	hnswPrecisionAuto     = "auto"
 	hnswPrecisionFP16     = "fp16"
 	hnswPrecisionFP32     = "fp32"

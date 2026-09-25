@@ -335,11 +335,17 @@ What it does:
   (`<root>/<collection>/index.bin`, CRC32, written to a temporary file and
   renamed). Snapshots are taken when a collection changed and has been quiet for
   two seconds, every `snapshot_interval` (1 m), on `Optimize` and on `Close`.
-  Timestamp-only changes are not worth a snapshot. A crash loses the writes
-  since the last snapshot; the next master cycle restores them because it diffs
-  against the store, and the fork's embedding fallback (section 3) covers the
-  gap for new items. A snapshot that fails its checksum is logged, counted and
-  started empty instead of keeping the master from starting.
+  Timestamp-only changes are not worth a snapshot. The previous snapshot is
+  kept as `index.bin.old` until the new one is in place (rename is not atomic
+  on Windows) and is loaded when `index.bin` is missing or fails its checksum.
+  A crash loses the writes since the last snapshot; the next master cycle
+  restores them because it diffs against the store, and the fork's embedding
+  fallback (section 3) covers the gap for new items. A collection with no
+  readable snapshot is logged, counted and started empty instead of keeping
+  the master from starting.
+- **Quantization.** `database.vector.quantization_type` is rejected at config
+  load for `hnsw://` and `xvec://` (both would fail every indexing task at
+  runtime); `precision` is the hnsw knob.
 
 ### The `xvec://` fallback
 

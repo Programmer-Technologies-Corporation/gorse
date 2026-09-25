@@ -578,6 +578,19 @@ func TestValidate(t *testing.T) {
 	suite.Run(t, new(ValidateTestSuite))
 }
 
+func (s *ValidateTestSuite) TestEmbeddedVectorStoreQuantization() {
+	s.Database.VectorStore = "hnsw:///var/lib/gorse/hnsw"
+	s.Database.Vector.QuantizationType = "sq"
+	s.Error(s.Validate())
+	s.Database.VectorStore = "xvec:///var/lib/gorse/vectors"
+	s.Error(s.Validate())
+	s.Database.VectorStore = "qdrant://localhost:6334"
+	s.NoError(s.Validate())
+	s.Database.VectorStore = "hnsw:///var/lib/gorse/hnsw"
+	s.Database.Vector.QuantizationType = ""
+	s.NoError(s.Validate())
+}
+
 func (s *ValidateTestSuite) TestQuota() {
 	s.NoError(s.Validate())
 	s.Quota.MaxLabelsSize = -1
