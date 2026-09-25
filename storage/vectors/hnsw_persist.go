@@ -31,8 +31,12 @@ import (
 
 // VideoHub fork: snapshot format of an hnsw:// collection. One little-endian
 // file holds the metadata, the vectors and the graph, followed by a CRC32 of
-// everything before it. It is written to a temporary file and renamed, so a
-// reader sees either the previous snapshot or the new one.
+// everything before it. A new snapshot is written to a temporary file, the
+// previous snapshot is moved aside and the temporary file renamed into place.
+// Rename is atomic on POSIX but not on Windows, so a crash between the two
+// renames can leave index.bin missing or partial; loading then falls back to
+// the moved-aside file, which is complete, so at most the writes since the
+// previous snapshot are lost.
 
 const (
 	hnswSnapshotMagic   = 0x49485647 // "GVHI"
@@ -180,6 +184,10 @@ func (f *hnswFrozen) writeFile(path string) (int64, error) {
 	if err = file.Close(); err != nil {
 		return 0, err
 	}
+	previous := filepath.Join(filepath.Dir(path), hnswPreviousSnapshot)
+	if err = os.Rename(path, previous); err != nil && !os.IsNotExist(err) {
+		return 0, err
+	}
 	if err = os.Rename(temporary, path); err != nil {
 		return 0, err
 	}
@@ -256,7 +264,27 @@ func (f *hnswFrozen) encode(w *snapshotWriter) {
 }
 
 func loadHNSWCollection(name, dir string, opts hnswOptions) (*hnswCollection, error) {
-	path := filepath.Join(dir, hnswSnapshotFile)
+	collection, err := loadHNSWSnapshot(filepath.Join(dir, hnswSnapshotFile), name, dir, opts)
+	if err == nil {
+		return collection, nil
+	}
+	previous := filepath.Join(dir, hnswPreviousSnapshot)
+	if _, statErr := os.Stat(previous); statErr != nil {
+		return nil, err
+	}
+	log.Logger().Warn("vector collection snapshot is unreadable, loading the previous one",
+		zap.String("collection", name), zap.Error(err))
+	collection, previousErr := loadHNSWSnapshot(previous, name, dir, opts)
+	if previousErr != nil {
+		return nil, err
+	}
+	// The recovered state is older than what was written last; mark it dirty so
+	// the next maintenance pass writes a fresh index.bin.
+	collection.savedVersion = 0
+	return collection, nil
+}
+
+func loadHNSWSnapshot(path, name, dir string, opts hnswOptions) (*hnswCollection, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, errors.WithStack(err)

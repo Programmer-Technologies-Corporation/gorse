@@ -374,6 +374,8 @@ func TestHNSWCorruptSnapshotStartsEmpty(t *testing.T) {
 	require.NoError(t, err)
 	raw[len(raw)/2] ^= 0xff
 	require.NoError(t, os.WriteFile(path, raw, 0o644))
+	// Without a previous snapshot to fall back to, the collection starts empty.
+	require.NoError(t, os.Remove(filepath.Join(root, "bad", hnswPreviousSnapshot)))
 
 	db = openHNSW(t, root, "")
 	defer db.Close()
@@ -382,6 +384,37 @@ func TestHNSWCorruptSnapshotStartsEmpty(t *testing.T) {
 	require.Equal(t, []string{"good"}, names)
 	// The writer recreates what it cannot find.
 	require.NoError(t, db.AddCollection(ctx, "bad", 4, Dot, VectorConfig{}))
+}
+
+func TestHNSWTornSnapshotRecoversPrevious(t *testing.T) {
+	log.SetTestLogger(t)
+	ctx := context.Background()
+	root := t.TempDir()
+	db := openHNSW(t, root, "")
+	require.NoError(t, db.AddCollection(ctx, "c", 4, Dot, VectorConfig{}))
+	require.NoError(t, db.AddVectors(ctx, "c", []Vector{{Id: "a", Values: []float32{1, 0, 0, 0}}}))
+	require.NoError(t, db.Optimize(ctx, "c"))
+	require.NoError(t, db.AddVectors(ctx, "c", []Vector{{Id: "b", Values: []float32{0, 1, 0, 0}}}))
+	require.NoError(t, db.Close())
+
+	dir := filepath.Join(root, "c")
+	_, err := os.Stat(filepath.Join(dir, hnswPreviousSnapshot))
+	require.NoError(t, err, "the previous snapshot is kept")
+	// Simulate a crash between the two renames: the current file is truncated.
+	require.NoError(t, os.WriteFile(filepath.Join(dir, hnswSnapshotFile), []byte{1, 2, 3}, 0o644))
+
+	db = openHNSW(t, root, "")
+	defer db.Close()
+	names, err := db.ListCollections(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []string{"c"}, names)
+	count, err := db.CountVectors(ctx, "c")
+	require.NoError(t, err)
+	require.EqualValues(t, 1, count, "the state of the previous snapshot")
+	require.NoError(t, db.Optimize(ctx, "c"))
+	stat, err := os.Stat(filepath.Join(dir, hnswSnapshotFile))
+	require.NoError(t, err)
+	require.Greater(t, stat.Size(), int64(3), "a fresh snapshot replaced the torn file")
 }
 
 func TestHNSWCompaction(t *testing.T) {

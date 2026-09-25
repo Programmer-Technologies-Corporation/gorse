@@ -868,6 +868,14 @@ func LoadConfig(path string) (*Config, error) {
 }
 
 func (config *Config) Validate() error {
+	// VideoHub fork: the embedded vector stores keep vectors as they are (hnsw
+	// picks FP16 or FP32 per collection) and reject quantization when a
+	// collection is created, which would fail every indexing task at runtime.
+	if storage.IsEmbeddedVectorStore(config.Database.VectorStore) && config.Database.Vector.QuantizationType != "" {
+		return errors.Errorf("vector_store %s does not support quantization_type %q; leave it empty or use a remote vector store",
+			config.Database.VectorStore, config.Database.Vector.QuantizationType)
+	}
+
 	// Check non-personalized recommenders
 	nonPersonalizedNames := mapset.NewSet[string]()
 	for _, nonPersonalized := range config.Recommend.NonPersonalized {
