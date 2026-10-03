@@ -427,14 +427,9 @@ func (m *Master) LoadDataFromDatabase(
 	for batchItems := range itemChan {
 		snapshot.ItemCount += int64(len(batchItems))
 		snapshot.ItemBytes += deepSize(batchItems)
-		if len(nonPersonalizedRecommenders) == 0 {
-			for _, item := range batchItems {
-				items = append(items, data.Item{ItemId: item.ItemId})
-			}
-		} else {
-			items = append(items, batchItems...)
-		}
 		for _, item := range batchItems {
+			labels := ctr.ConvertLabels(item.Labels)
+			item.Labels = ctr.ConvertEmbeddingLabels(item.Labels)
 			dataSet.AddItem(item)
 			itemIndex := dataSet.GetItemDict().Id(item.ItemId)
 			if len(itemLabels) == int(itemIndex) {
@@ -444,7 +439,6 @@ func (m *Master) LoadDataFromDatabase(
 				itemEmbeddings = append(itemEmbeddings, nil)
 			}
 			// load labels
-			labels := ctr.ConvertLabels(item.Labels)
 			itemLabels[itemIndex] = make([]lo.Tuple2[int32, float32], 0, len(labels))
 			for _, feature := range labels {
 				itemLabelCount[feature.Name]++
@@ -483,6 +477,11 @@ func (m *Master) LoadDataFromDatabase(
 					itemEmbeddingDimension = append(itemEmbeddingDimension, make(map[int]int))
 				}
 				itemEmbeddingDimension[itemEmbeddingIndex][len(itemEmbeddings[itemIndex][itemEmbeddingIndex])]++
+			}
+			if len(nonPersonalizedRecommenders) == 0 {
+				items = append(items, data.Item{ItemId: item.ItemId})
+			} else {
+				items = append(items, item)
 			}
 		}
 		span.Add(len(batchItems))
