@@ -20,6 +20,7 @@ import (
 	"github.com/gorse-io/gorse/common/log"
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
+	"go.mongodb.org/mongo-driver/bson"
 )
 
 var (
@@ -70,6 +71,34 @@ func TestMongo(t *testing.T) {
 		t.Skip("MONGO_URI is not set, skipping MongoDB test")
 	}
 	suite.Run(t, new(MongoTestSuite))
+}
+
+func (suite *MongoTestSuite) TestBatchGetVisibleIDsLegacyVisibility() {
+	ctx := suite.T().Context()
+	db := suite.getMongoDB()
+	collection := db.client.Database(db.dbName).Collection(db.ItemsTable())
+	_, err := collection.InsertMany(ctx, []any{
+		bson.M{"itemid": "missing-flag", "categories": bson.A{"a", "b"}},
+		bson.M{"itemid": "null-flag", "ishidden": nil, "categories": bson.A{"a", "b"}},
+		bson.M{"itemid": "visible", "ishidden": false, "categories": bson.A{"a", "b"}},
+		bson.M{"itemid": "hidden", "ishidden": true, "categories": bson.A{"a", "b"}},
+		bson.M{"itemid": "wrong-category", "categories": bson.A{"a"}},
+	})
+	suite.Require().NoError(err)
+	ids := []string{"missing-flag", "null-flag", "visible", "hidden", "wrong-category", "absent"}
+	// Establish the legacy full-read interpretation before comparing projection.
+	full, err := db.BatchGetItems(ctx, ids, GetOptions{})
+	suite.Require().NoError(err)
+	var expected []Item
+	for _, item := range full {
+		if !item.IsHidden && len(item.Categories) == 2 {
+			expected = append(expected, Item{ItemId: item.ItemId})
+		}
+	}
+	projected, err := db.BatchGetItems(ctx, ids, GetOptions{Categories: []string{"a", "b"}, SkipHidden: true, ReturnId: true})
+	suite.Require().NoError(err)
+	suite.ElementsMatch([]Item{{ItemId: "missing-flag"}, {ItemId: "null-flag"}, {ItemId: "visible"}}, expected)
+	suite.ElementsMatch(expected, projected)
 }
 
 func BenchmarkMongo_CountItems(b *testing.B) {

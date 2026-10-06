@@ -815,18 +815,19 @@ func (s *RestServer) getItemToItem(request *restful.Request, response *restful.R
 
 // FilterVisibleItemsByCategories removes hidden items and items that don't contain all required categories.
 func FilterVisibleItemsByCategories(ctx context.Context, dataClient data.Database, scores []cache.Score, categories []string) ([]cache.Score, error) {
-	items, err := dataClient.BatchGetItems(ctx, cache.ConvertDocumentsToValues(scores), data.GetOptions{})
+	// Check current item state in the data store without loading labels (which can
+	// include embeddings). Vector metadata may lag visibility/category updates.
+	items, err := dataClient.BatchGetItems(ctx, cache.ConvertDocumentsToValues(scores), data.GetOptions{
+		Categories: categories,
+		SkipHidden: true,
+		ReturnId:   true,
+	})
 	if err != nil {
 		return nil, err
 	}
 	visibleItems := mapset.NewSet[string]()
 	for _, item := range items {
-		categoryMatched := len(categories) == 0 || lo.EveryBy(categories, func(category string) bool {
-			return lo.Contains(item.Categories, category)
-		})
-		if !item.IsHidden && categoryMatched {
-			visibleItems.Add(item.ItemId)
-		}
+		visibleItems.Add(item.ItemId)
 	}
 	return lo.Filter(scores, func(score cache.Score, _ int) bool {
 		return visibleItems.Contains(score.Id)

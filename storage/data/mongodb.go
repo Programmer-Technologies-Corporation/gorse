@@ -348,7 +348,9 @@ func (db *MongoDB) BatchGetItems(ctx context.Context, itemIds []string, opts Get
 	}
 	// Add hidden filter if specified
 	if opts.SkipHidden {
-		filter["ishidden"] = false
+		// Older documents may omit the field or store null; decoding those into
+		// Item treats them as false. Preserve that visibility when projecting IDs.
+		filter["ishidden"] = bson.M{"$in": bson.A{false, nil}}
 	}
 	// Add time filter if specified
 	if opts.After != nil {

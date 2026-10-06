@@ -678,6 +678,13 @@ func (suite *baseTestSuite) TestBatchGetItems() {
 		suite.NotEmpty(item.ItemId)
 		suite.Empty(item.Categories) // other fields should be empty
 	}
+	// The recommendation visibility path combines every option and uses the
+	// returned IDs to retain the original score ordering. Exercise store/proxy
+	// option forwarding and projection together, including missing/hidden IDs.
+	visibleIDs, err := suite.Database.BatchGetItems(ctx, []string{"1", "2", "3", "4", "missing"},
+		GetOptions{Categories: []string{"a", "b"}, SkipHidden: true, ReturnId: true})
+	suite.NoError(err)
+	suite.Equal([]Item{{ItemId: "4"}}, visibleIDs)
 
 	// Test batch get with After time filter (cutoff at item timestamp)
 	afterTime := time.Date(1996, 3, 15, 0, 0, 0, 0, time.UTC)
