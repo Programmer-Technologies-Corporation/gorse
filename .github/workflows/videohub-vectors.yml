@@ -39,10 +39,17 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Test HNSW and feedback cancellation including race detection
+      - name: Test HNSW, feedback cancellation and dataset retention including race detection
         run: >-
           go test -race ./storage/vectors ./logics ./server ./master ./worker
-          -run '^(TestHNSW.*|TestNewRecommender(FeedbackCancellation|FullFeedback)|TestGetRecommendFeedback(Cancellation|Success))$'
+          -run '^(TestHNSW.*|TestDatasetRetentionLoader|TestNewRecommender(FeedbackCancellation|FullFeedback)|TestGetRecommendFeedback(Cancellation|Success))$'
+          -count=1 -timeout=10m
+      # The legacy parallel loader has baseline races; see dataset-retention.md.
+      # Keep its functional coverage separate from the focused race gate above.
+      - name: Test SQLite dataset loader invariants
+        run: >-
+          go test ./master
+          -run '^TestMaster$/(TestLoadDataFromDatabase.*|TestNonPersonalizedRecommend|TestEmitSnapshot)$'
           -count=1 -timeout=10m
       - name: Build deployed components
         env:
