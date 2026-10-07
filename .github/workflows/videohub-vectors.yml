@@ -1,0 +1,39 @@
+name: VideoHub vector store
+
+on:
+  pull_request:
+    branches: [videohub]
+    paths:
+      - storage/vectors/**
+      - common/floats/**
+      - go.mod
+      - go.sum
+      - .github/workflows/videohub-vectors.yml
+  push:
+    branches: [videohub]
+    paths:
+      - storage/vectors/**
+      - common/floats/**
+      - go.mod
+      - go.sum
+      - .github/workflows/videohub-vectors.yml
+
+permissions:
+  contents: read
+
+jobs:
+  hnsw:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test HNSW including race detection
+        run: go test -race ./storage/vectors -run '^TestHNSW' -count=1 -timeout=10m
+      - name: Build deployed components
+        env:
+          CGO_ENABLED: '0'
+        run: go build ./cmd/gorse-master ./cmd/gorse-server ./cmd/gorse-worker
