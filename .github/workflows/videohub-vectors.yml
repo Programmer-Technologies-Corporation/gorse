@@ -1,10 +1,14 @@
-name: VideoHub vector store
+name: VideoHub focused Go checks
 
 on:
   pull_request:
     branches: [videohub]
     paths:
       - storage/vectors/**
+      - logics/**
+      - server/**
+      - master/**
+      - worker/**
       - common/floats/**
       - go.mod
       - go.sum
@@ -13,6 +17,10 @@ on:
     branches: [videohub]
     paths:
       - storage/vectors/**
+      - logics/**
+      - server/**
+      - master/**
+      - worker/**
       - common/floats/**
       - go.mod
       - go.sum
@@ -22,7 +30,7 @@ permissions:
   contents: read
 
 jobs:
-  hnsw:
+  serving:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -31,8 +39,11 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Test HNSW including race detection
-        run: go test -race ./storage/vectors -run '^TestHNSW' -count=1 -timeout=10m
+      - name: Test HNSW and feedback cancellation including race detection
+        run: >-
+          go test -race ./storage/vectors ./logics ./server ./master ./worker
+          -run '^(TestHNSW.*|TestNewRecommender(FeedbackCancellation|FullFeedback)|TestGetRecommendFeedback(Cancellation|Success))$'
+          -count=1 -timeout=10m
       - name: Build deployed components
         env:
           CGO_ENABLED: '0'
