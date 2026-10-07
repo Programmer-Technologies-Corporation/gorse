@@ -156,3 +156,33 @@ func offsetVectors(data [][]float32, start, end int, timestamp time.Time) []Vect
 	}
 	return vectors
 }
+
+// Incremental ingestion refreshes one item at a time, unlike the bulk cycle.
+func BenchmarkHNSWUnchangedRefresh(b *testing.B) {
+	for _, n := range []int{10000, 100000} {
+		b.Run(fmt.Sprintf("n=%d", n), func(b *testing.B) {
+			ctx := context.Background()
+			data := embeddingLike(1, n, 256)
+			db := openHNSW(b, b.TempDir(), "?snapshot_interval=24h")
+			defer db.Close()
+			require.NoError(b, db.AddCollection(ctx, "refresh", 256, Euclidean, VectorConfig{}))
+			timestamp := time.UnixMilli(1700000000000)
+			for i := 0; i < n; i += 1024 {
+				require.NoError(b, db.AddVectors(ctx, "refresh", offsetVectors(data, i, min(i+1024, n), timestamp)))
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				slot := (i*7919 + 13) % n
+				err := db.AddVectors(ctx, "refresh", []Vector{{
+					Id: fmt.Sprintf("item-%d", slot), Values: data[slot],
+					Timestamp: timestamp.Add(time.Duration(i+1) * time.Millisecond),
+				}})
+				if err != nil {
+					b.Fatal(err)
+				}
+			}
+			b.StopTimer()
+		})
+	}
+}

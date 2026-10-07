@@ -883,6 +883,14 @@ func (c *hnswCollection) upsert(ctx context.Context, vectors []Vector) error {
 	}
 
 	var inserted, replaced, unchanged, updated int
+	defer func() {
+		// Timestamp-only refreshes change neither counts nor estimated memory.
+		// Recounting walks the entire index, so skip it for unchanged ingestion.
+		// Publish partial mutations too if cancellation interrupts a batch.
+		if inserted+replaced+updated > 0 {
+			c.publishGauges()
+		}
+	}()
 	var encoded []uint16
 	for i, vector := range vectors {
 		if err := ctx.Err(); err != nil {
@@ -948,7 +956,6 @@ func (c *hnswCollection) upsert(ctx context.Context, vectors []Vector) error {
 	hnswUpsertsTotal.WithLabelValues(c.name, "replaced").Add(float64(replaced))
 	hnswUpsertsTotal.WithLabelValues(c.name, "unchanged").Add(float64(unchanged))
 	hnswUpsertsTotal.WithLabelValues(c.name, "metadata").Add(float64(updated))
-	c.publishGauges()
 	return nil
 }
 

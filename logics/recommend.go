@@ -58,10 +58,13 @@ type Recommender struct {
 
 type RecommenderFunc func(ctx context.Context) ([]cache.Score, string, error)
 
-func NewRecommender(config config.RecommendConfig, cacheClient cache.Database, dataClient data.Database, vectorClient vectors.Database, online bool, userId string, categories []string) (*Recommender, error) {
+func NewRecommender(ctx context.Context, config config.RecommendConfig, cacheClient cache.Database, dataClient data.Database, vectorClient vectors.Database, online bool, userId string, categories []string) (*Recommender, error) {
 	// Load user feedback
-	userFeedback, err := dataClient.GetUserFeedback(context.Background(), userId, new(time.Now()))
+	userFeedback, err := dataClient.GetUserFeedback(ctx, userId, new(time.Now()))
 	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	excludeSet := mapset.NewSet[string]()
