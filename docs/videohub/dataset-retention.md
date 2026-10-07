@@ -89,5 +89,19 @@ Set NONEMPTY to 1 for the raw-label consumer control and DIAGNOSTIC to 1 for
 phase live-heap measurement. Use ITEMS=10000 for the smaller fixture. Profile
 only separate samples by setting GORSE_RETENTION_PROFILE to an output prefix.
 Do not mix those results into unprofiled timing comparisons. The experiment is
-opt-in and skipped by normal test runs; focused Linux CI runs correctness tests
-with the race detector and builds all three deployed components.
+opt-in and skipped by normal test runs. Focused Linux CI runs the new retention
+and serving regressions with the race detector, runs existing SQLite loader
+tests as functional checks, and builds all three deployed components.
+
+### Existing parallel-loader race limitation
+
+Adding race detection to the existing SQLite suite exposed pre-existing races
+in shared feedback counts/frequencies, progress counters, callback errors and
+test teardown versus asynchronous reconciliation. The same mechanisms reproduced
+on unchanged base `39614f4` in
+[the baseline diagnostic run](https://github.com/Programmer-Technologies-Corporation/gorse/actions/runs/37690555781).
+The retention edit is confined to single-threaded item loading before these
+parallel phases; it does not repair their synchronization. Frequency races can
+affect training weights and are not merely diagnostic noise. They need a
+separate concurrency fix. The legacy suite's functional pass must not be
+described as a race-clean parallel loader; the focused race gate remains enabled.
