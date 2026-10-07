@@ -421,7 +421,13 @@ func (m *Master) LoadDataFromDatabase(
 	for batchItems := range itemChan {
 		snapshot.ItemCount += int64(len(batchItems))
 		snapshot.ItemBytes += deepSize(batchItems)
-		items = append(items, batchItems...)
+		if len(nonPersonalizedRecommenders) == 0 {
+			for _, item := range batchItems {
+				items = append(items, data.Item{ItemId: item.ItemId})
+			}
+		} else {
+			items = append(items, batchItems...)
+		}
 		for _, item := range batchItems {
 			dataSet.AddItem(item)
 			itemIndex := dataSet.GetItemDict().Id(item.ItemId)
