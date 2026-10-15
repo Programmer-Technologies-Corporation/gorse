@@ -92,12 +92,18 @@ type Master struct {
 	collaborativeFilteringTrainSetSize int
 	collaborativeFilteringMeta         meta.Model[cf.Score]
 	collaborativeFilteringTarget       meta.Model[cf.Score]
+	collaborativeFilteringLastOptimize time.Time
 
 	// click model
 	clickThroughRateModelMutex   sync.RWMutex
 	clickThroughRateTrainSetSize int
 	clickThroughRateMeta         meta.Model[ctr.Score]
 	clickThroughRateTarget       meta.Model[ctr.Score]
+	clickThroughRateLastOptimize time.Time
+
+	// Optimization checkpoints belong to the serialized task loop. A new master
+	// remains eligible for its first search; tests can control only this clock.
+	optimizationNow func() time.Time
 
 	// oauth2
 	oauth2Config oauth2.Config

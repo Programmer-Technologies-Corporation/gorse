@@ -297,17 +297,23 @@ func (m *Master) runLoadDatasetTask(ctx context.Context) error {
 	if err = m.runTask("cache_stats", func() error { return m.collectCacheStats(ctx) }); err != nil {
 		log.Logger().Error("failed to collect cache statistics", zap.Error(err))
 	}
-	if useCollaborativeFilteringTasks && m.Config.Recommend.Collaborative.OptimizePeriod > 0 {
-		if err = m.runTask("optimize_collaborative_filtering", func() error {
-			return m.optimizeCollaborativeFiltering(ctx, datasets.rankingTrainSet, datasets.rankingTestSet)
-		}); err != nil {
+	m.ConfigMutex.RLock()
+	collaborativeOptimizePeriod := m.Config.Recommend.Collaborative.OptimizePeriod
+	rankerOptimizePeriod := m.Config.Recommend.Ranker.OptimizePeriod
+	m.ConfigMutex.RUnlock()
+	if useCollaborativeFilteringTasks {
+		if err = m.runOptimizationTask(ctx, "optimize_collaborative_filtering", collaborativeOptimizePeriod,
+			&m.collaborativeFilteringLastOptimize, func() (bool, error) {
+				return m.optimizeCollaborativeFiltering(ctx, datasets.rankingTrainSet, datasets.rankingTestSet)
+			}); err != nil {
 			log.Logger().Error("failed to optimize collaborative filtering model", zap.Error(err))
 		}
 	}
-	if useClickThroughRateTasks && m.Config.Recommend.Ranker.OptimizePeriod > 0 {
-		if err = m.runTask("optimize_click_through_rate", func() error {
-			return m.optimizeClickThroughRatePrediction(ctx, datasets.clickTrainSet, datasets.clickTestSet)
-		}); err != nil {
+	if useClickThroughRateTasks {
+		if err = m.runOptimizationTask(ctx, "optimize_click_through_rate", rankerOptimizePeriod,
+			&m.clickThroughRateLastOptimize, func() (bool, error) {
+				return m.optimizeClickThroughRatePrediction(ctx, datasets.clickTrainSet, datasets.clickTestSet)
+			}); err != nil {
 			log.Logger().Error("failed to optimize click-through rate prediction model", zap.Error(err))
 		}
 	}
@@ -1340,19 +1346,19 @@ func (m *Master) collectGarbage(parent context.Context, dataSet *dataset.Dataset
 	return nil
 }
 
-func (m *Master) optimizeCollaborativeFiltering(parent context.Context, trainSet, testSet dataset.CFSplit) error {
+func (m *Master) optimizeCollaborativeFiltering(parent context.Context, trainSet, testSet dataset.CFSplit) (bool, error) {
 	ctx, span := m.tracer.Start(parent, "Optimize Collaborative Filtering Model", m.Config.Recommend.Collaborative.OptimizeTrials)
 	defer span.End()
 
 	if trainSet.CountUsers() == 0 {
 		span.Fail(errors.New("No user found."))
-		return nil
+		return false, nil
 	} else if trainSet.CountItems() == 0 {
 		span.Fail(errors.New("No item found."))
-		return nil
+		return false, nil
 	} else if trainSet.CountFeedback() == 0 {
 		span.Fail(errors.New("No feedback found."))
-		return nil
+		return false, nil
 	}
 
 	search := cf.NewModelSearch(map[string]cf.ModelCreator{
@@ -1374,11 +1380,11 @@ func (m *Master) optimizeCollaborativeFiltering(parent context.Context, trainSet
 		goptuna.StudyOptionSampler(tpe.NewSampler()),
 		goptuna.StudyOptionLogger(log.NewOptunaLogger(log.Logger())))
 	if err != nil {
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
 	study.WithContext(ctx)
 	if err = study.Optimize(search.Objective, m.Config.Recommend.Collaborative.OptimizeTrials); err != nil {
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
 	m.collaborativeFilteringModelMutex.Lock()
 	m.collaborativeFilteringTarget = search.Result()
@@ -1387,22 +1393,22 @@ func (m *Master) optimizeCollaborativeFiltering(parent context.Context, trainSet
 		zap.Any("score", m.collaborativeFilteringTarget.Score),
 		zap.String("type", m.collaborativeFilteringTarget.Type),
 		zap.Any("params", m.collaborativeFilteringTarget.Params))
-	return nil
+	return true, nil
 }
 
-func (m *Master) optimizeClickThroughRatePrediction(parent context.Context, trainSet, testSet *ctr.Dataset) error {
+func (m *Master) optimizeClickThroughRatePrediction(parent context.Context, trainSet, testSet *ctr.Dataset) (bool, error) {
 	ctx, span := m.tracer.Start(parent, "Optimize Click-Through Rate Prediction Model", m.Config.Recommend.Ranker.OptimizeTrials)
 	defer span.End()
 
 	if trainSet.CountUsers() == 0 {
 		span.Fail(errors.New("No user found."))
-		return nil
+		return false, nil
 	} else if trainSet.CountItems() == 0 {
 		span.Fail(errors.New("No item found."))
-		return nil
+		return false, nil
 	} else if trainSet.Count() == 0 {
 		span.Fail(errors.New("No feedback found."))
-		return nil
+		return false, nil
 	}
 
 	search := ctr.NewModelSearch(map[string]ctr.ModelCreator{
@@ -1421,11 +1427,11 @@ func (m *Master) optimizeClickThroughRatePrediction(parent context.Context, trai
 		goptuna.StudyOptionSampler(tpe.NewSampler()),
 		goptuna.StudyOptionLogger(log.NewOptunaLogger(log.Logger())))
 	if err != nil {
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
 	study.WithContext(ctx)
 	if err = study.Optimize(search.Objective, m.Config.Recommend.Ranker.OptimizeTrials); err != nil {
-		return errors.WithStack(err)
+		return false, errors.WithStack(err)
 	}
 	m.clickThroughRateModelMutex.Lock()
 	m.clickThroughRateTarget = search.Result()
@@ -1434,7 +1440,7 @@ func (m *Master) optimizeClickThroughRatePrediction(parent context.Context, trai
 		zap.Any("score", m.clickThroughRateTarget.Score),
 		zap.String("type", m.clickThroughRateTarget.Type),
 		zap.Any("params", m.clickThroughRateTarget.Params))
-	return nil
+	return true, nil
 }
 
 // updateRecommend updates recommendations for all user in standalone mode.
