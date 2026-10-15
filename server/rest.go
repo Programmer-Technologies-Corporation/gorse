@@ -1578,6 +1578,11 @@ func (s *RestServer) batchInsertItems(ctx context.Context, response *restful.Res
 	}
 	insertItemsTime = time.Since(start)
 	if data.IsTwitchLiveProjection(ctx) {
+		// Persistence already committed. Complete required cache/index refresh
+		// even if the HTTP caller has disconnected, with a bounded deadline.
+		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancelRefresh()
+		ctx = refreshCtx
 		// The storage layer can preserve an independent embedding/label patch.
 		// Index the committed representation, never the stale incoming vector.
 		persisted, readErr := s.DataClient.BatchGetItems(ctx, lo.Map(items, func(item data.Item, _ int) string { return item.ItemId }), data.GetOptions{})

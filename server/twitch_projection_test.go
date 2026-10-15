@@ -1,10 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/gorse-io/gorse/storage"
@@ -16,11 +20,28 @@ import (
 type projectionRecorder struct {
 	data.Database
 	projection bool
+	afterWrite func()
 }
 
 func (d *projectionRecorder) BatchInsertItems(ctx context.Context, items []data.Item) error {
 	d.projection = data.IsTwitchLiveProjection(ctx)
-	return d.Database.BatchInsertItems(ctx, items)
+	err := d.Database.BatchInsertItems(ctx, items)
+	if err == nil && d.afterWrite != nil {
+		d.afterWrite()
+	}
+	return err
+}
+
+func (d *projectionRecorder) PatchItemLabelsAtomic(ctx context.Context, id string, patch map[string]any, validate func(data.Item) error) (data.Item, bool, error) {
+	patcher, ok := d.Database.(data.AtomicItemLabelPatcher)
+	if !ok {
+		return data.Item{}, false, nil
+	}
+	item, handled, err := patcher.PatchItemLabelsAtomic(ctx, id, patch, validate)
+	if err == nil && handled && d.afterWrite != nil {
+		d.afterWrite()
+	}
+	return item, handled, err
 }
 
 func (suite *ServerTestSuite) TestTwitchProjectionIntentDoesNotChangeOrdinaryUpserts() {
@@ -73,5 +94,51 @@ func (suite *ServerTestSuite) TestMySQLTwitchProjectionKeepsPatchedVectorInIndex
 	indexed, err := suite.VectorClient.GetVectors(suite.T().Context(), vectors.ItemToItemCollection("neighbors"), []string{"live"})
 	suite.Require().NoError(err)
 	suite.Require().Len(indexed, 1)
+	suite.Equal([]float32{1, 0}, indexed[0].Values)
+
+	// An atomic label patch also completes its post-commit refresh after the
+	// caller cancels, without restoring an old viewer count.
+	patchCtx, cancelPatch := context.WithCancel(context.Background())
+	defer cancelPatch()
+	suite.DataClient = &projectionRecorder{Database: db, afterWrite: cancelPatch}
+	request := httptest.NewRequest(http.MethodPatch, "/api/item/live/labels", strings.NewReader(`{"embedding":[0,1]}`)).WithContext(patchCtx)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-API-Key", apiKey)
+	response := httptest.NewRecorder()
+	suite.handler.ServeHTTP(response, request)
+	suite.Require().ErrorIs(patchCtx.Err(), context.Canceled)
+	suite.Equal(http.StatusOK, response.Code, response.Body.String())
+	indexed, err = suite.VectorClient.GetVectors(suite.T().Context(), vectors.ItemToItemCollection("neighbors"), []string{"live"})
+	suite.Require().NoError(err)
+	suite.Require().Len(indexed, 1)
+	suite.Equal([]float32{0, 1}, indexed[0].Values)
+}
+
+func (suite *ServerTestSuite) TestTwitchProjectionRefreshSurvivesRequestCancellation() {
+	suite.enableIncrementalItemToItem()
+	original := suite.DataClient
+	apitest.New().Handler(suite.handler).Post("/api/items").Header("X-API-Key", apiKey).
+		JSON([]Item{{ItemId: "canceled", Timestamp: "2026-10-04T12:00:00Z", Categories: []string{"old"}, Labels: map[string]any{"embedding": []float64{0, 1}}}}).
+		Expect(suite.T()).Status(http.StatusOK).End()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	suite.DataClient = &projectionRecorder{Database: original, afterWrite: cancel}
+	defer func() { suite.DataClient = original }()
+	item := Item{ItemId: "canceled", Timestamp: "2026-10-04T12:00:00Z", IsHidden: true,
+		Categories: []string{"restricted"}, Labels: map[string]any{"embedding": []float64{1, 0}}}
+	body, err := json.Marshal([]Item{item})
+	suite.Require().NoError(err)
+	request := httptest.NewRequest(http.MethodPost, "/api/items?twitch_live_projection=true", bytes.NewReader(body)).WithContext(ctx)
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set("X-API-Key", apiKey)
+	recorder := httptest.NewRecorder()
+	suite.handler.ServeHTTP(recorder, request)
+	suite.Require().ErrorIs(ctx.Err(), context.Canceled)
+	suite.Equal(http.StatusOK, recorder.Code, recorder.Body.String())
+	indexed, err := suite.VectorClient.GetVectors(context.Background(), vectors.ItemToItemCollection("neighbors"), []string{"canceled"})
+	suite.Require().NoError(err)
+	suite.Require().Len(indexed, 1)
+	suite.True(indexed[0].IsHidden)
+	suite.Equal([]string{"restricted"}, indexed[0].Categories)
 	suite.Equal([]float32{1, 0}, indexed[0].Values)
 }

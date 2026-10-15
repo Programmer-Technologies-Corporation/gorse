@@ -42,7 +42,9 @@ The projection handler shares the existing per-item HTTP mutex with label
 patches through cache/vector refresh. After commit it re-reads and indexes the
 stored representation, so a preserved embedding is not replaced by the old
 incoming vector in the recommendation index. Projection cache metadata is
-updated after successful persistence. All application writes must continue to
+updated after successful persistence. Required post-commit read/cache/index work
+uses a detached, bounded 10-second context so client cancellation cannot skip
+the refresh immediately after a successful commit. All application writes must continue to
 use the configured common Gorse master endpoint; this does not introduce a
 new cross-server vector-cache ordering protocol.
 

@@ -329,6 +329,11 @@ func (s *RestServer) patchItemLabels(request *restful.Request, response *restful
 		}
 		return
 	}
+	if handled {
+		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancelRefresh()
+		ctx = refreshCtx
+	}
 	if err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, itemId), time.Now())); err != nil {
 		LabelPatchTotal.WithLabelValues("error").Inc()
 		InternalServerError(response, err)
