@@ -90,10 +90,11 @@ type DatabaseConfig struct {
 }
 
 type MySQLConfig struct {
-	IsolationLevel  string        `mapstructure:"isolation_level" validate:"oneof=READ-UNCOMMITTED READ-COMMITTED REPEATABLE-READ SERIALIZABLE"`
-	MaxOpenConns    int           `mapstructure:"max_open_conns" validate:"gte=0"`
-	MaxIdleConns    int           `mapstructure:"max_idle_conns" validate:"gte=0"`
-	ConnMaxLifetime time.Duration `mapstructure:"conn_max_lifetime" validate:"gte=0"`
+	SeparateTwitchViewCounts bool          `mapstructure:"separate_twitch_view_counts"`
+	IsolationLevel           string        `mapstructure:"isolation_level" validate:"oneof=READ-UNCOMMITTED READ-COMMITTED REPEATABLE-READ SERIALIZABLE"`
+	MaxOpenConns             int           `mapstructure:"max_open_conns" validate:"gte=0"`
+	MaxIdleConns             int           `mapstructure:"max_idle_conns" validate:"gte=0"`
+	ConnMaxLifetime          time.Duration `mapstructure:"conn_max_lifetime" validate:"gte=0"`
 }
 
 type SQLConfig struct {
@@ -114,6 +115,7 @@ func (db *DatabaseConfig) StorageOptions(path string) []storage.Option {
 	if strings.HasPrefix(path, storage.MySQLPrefix) {
 		return []storage.Option{
 			storage.WithIsolationLevel(db.MySQL.IsolationLevel),
+			storage.WithSeparateTwitchViewCounts(db.MySQL.SeparateTwitchViewCounts),
 			storage.WithMaxOpenConns(db.MySQL.MaxOpenConns),
 			storage.WithMaxIdleConns(db.MySQL.MaxIdleConns),
 			storage.WithConnMaxLifetime(db.MySQL.ConnMaxLifetime),
@@ -676,6 +678,7 @@ func setDefault() {
 	viper.SetDefault("database.vector_table_prefix", defaultConfig.Database.VectorTablePrefix)
 	viper.SetDefault("database.cache_client_name", defaultConfig.Database.CacheClientName)
 	// [database.mysql]
+	viper.SetDefault("database.mysql.separate_twitch_view_counts", false)
 	viper.SetDefault("database.mysql.isolation_level", defaultConfig.Database.MySQL.IsolationLevel)
 	viper.SetDefault("database.mysql.max_open_conns", defaultConfig.Database.MySQL.MaxOpenConns)
 	viper.SetDefault("database.mysql.max_idle_conns", defaultConfig.Database.MySQL.MaxIdleConns)

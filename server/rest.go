@@ -1553,13 +1553,14 @@ func (s *RestServer) batchInsertItems(ctx context.Context, response *restful.Res
 			return
 		}
 		items = append(items, dataItem)
-		// update items cache
-		if err = s.CacheClient.UpdateScores(ctx, cache.ItemCache, nil, item.ItemId, cache.ScorePatch{
-			Categories: withWildCard(item.Categories),
-			IsHidden:   &item.IsHidden,
-		}); err != nil {
-			InternalServerError(response, err)
-			return
+		// Projections refresh cache metadata only after their transaction commits.
+		if !data.IsTwitchLiveProjection(ctx) {
+			if err = s.CacheClient.UpdateScores(ctx, cache.ItemCache, nil, item.ItemId, cache.ScorePatch{
+				Categories: withWildCard(item.Categories), IsHidden: &item.IsHidden,
+			}); err != nil {
+				InternalServerError(response, err)
+				return
+			}
 		}
 		count++
 	}
@@ -1576,6 +1577,28 @@ func (s *RestServer) batchInsertItems(ctx context.Context, response *restful.Res
 		return
 	}
 	insertItemsTime = time.Since(start)
+	if data.IsTwitchLiveProjection(ctx) {
+		// The storage layer can preserve an independent embedding/label patch.
+		// Index the committed representation, never the stale incoming vector.
+		persisted, readErr := s.DataClient.BatchGetItems(ctx, lo.Map(items, func(item data.Item, _ int) string { return item.ItemId }), data.GetOptions{})
+		if readErr != nil {
+			InternalServerError(response, readErr)
+			return
+		}
+		if len(persisted) != len(items) {
+			InternalServerError(response, errors.New("projected item disappeared before cache refresh"))
+			return
+		}
+		items = persisted
+		for _, item := range items {
+			if err = s.CacheClient.UpdateScores(ctx, cache.ItemCache, nil, item.ItemId, cache.ScorePatch{
+				Categories: withWildCard(item.Categories), IsHidden: &item.IsHidden,
+			}); err != nil {
+				InternalServerError(response, err)
+				return
+			}
+		}
+	}
 	s.indexItemVectors(ctx, items)
 
 	// insert modify timestamp
@@ -1614,6 +1637,18 @@ func (s *RestServer) insertItems(request *restful.Request, response *restful.Res
 			BadRequest(response, err)
 			return
 		}
+	}
+	// Older servers safely ignore this optional query parameter and retain
+	// full-upsert behavior. Ordinary clients retain replacement semantics.
+	if request.QueryParameter("twitch_live_projection") == "true" {
+		if len(items) != 1 {
+			BadRequest(response, errors.New("a Twitch live projection requires exactly one item"))
+			return
+		}
+		lock := itemLock(items[0].ItemId)
+		lock.Lock()
+		defer lock.Unlock()
+		ctx = data.WithTwitchLiveProjection(ctx)
 	}
 	// Insert items
 	s.batchInsertItems(ctx, response, items)
