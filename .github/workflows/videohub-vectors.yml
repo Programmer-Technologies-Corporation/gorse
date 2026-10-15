@@ -4,6 +4,10 @@ on:
   pull_request:
     branches: [videohub]
     paths:
+      - storage/data/**
+      - storage/options.go
+      - config/**
+      - model/ctr/**
       - storage/vectors/**
       - logics/**
       - server/**
@@ -16,6 +20,10 @@ on:
   push:
     branches: [videohub]
     paths:
+      - storage/data/**
+      - storage/options.go
+      - config/**
+      - model/ctr/**
       - storage/vectors/**
       - logics/**
       - server/**
@@ -55,3 +63,29 @@ jobs:
         env:
           CGO_ENABLED: '0'
         run: go build ./cmd/gorse-master ./cmd/gorse-server ./cmd/gorse-worker
+
+  twitch_view_counts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      mysql:
+        image: mysql:8.0.32
+        env:
+          MYSQL_ROOT_PASSWORD: isolated-test-password
+          MYSQL_DATABASE: gorse_counts_test
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h localhost -pisolated-test-password"
+          --health-interval=5s --health-timeout=5s --health-retries=20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Test MySQL upgrade, reader parity, atomic projection and concurrent labels
+        env:
+          MYSQL_URI: mysql://root:isolated-test-password@tcp(127.0.0.1:3306)/
+          TWITCH_COUNT_MYSQL_URI: mysql://root:isolated-test-password@tcp(127.0.0.1:3306)/gorse_counts_test
+        run: go test -race ./storage/data ./server ./config ./model/ctr -count=1 -timeout=10m

@@ -6,12 +6,13 @@ import (
 )
 
 type Options struct {
-	IsolationLevel   string
-	MaxOpenConns     int
-	MaxIdleConns     int
-	ConnMaxLifetime  time.Duration
-	MaxSearchResults int
-	RedisClientName  string
+	SeparateTwitchViewCounts bool
+	IsolationLevel           string
+	MaxOpenConns             int
+	MaxIdleConns             int
+	ConnMaxLifetime          time.Duration
+	MaxSearchResults         int
+	RedisClientName          string
 }
 
 type Option func(*Options)
@@ -73,4 +74,9 @@ func NewOptions(opts ...Option) Options {
 		o(&opt)
 	}
 	return opt
+}
+
+// WithSeparateTwitchViewCounts opts into the coordinated MySQL storage layout.
+func WithSeparateTwitchViewCounts(enabled bool) Option {
+	return func(o *Options) { o.SeparateTwitchViewCounts = enabled }
 }

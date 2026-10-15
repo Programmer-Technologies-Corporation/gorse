@@ -289,10 +289,50 @@ func (s *RestServer) patchItemLabels(request *restful.Request, response *restful
 		BadRequest(response, err)
 		return
 	}
-	if err = s.DataClient.ModifyItem(ctx, itemId, data.ItemPatch{Labels: merged}); err != nil {
-		LabelPatchTotal.WithLabelValues("error").Inc()
-		InternalServerError(response, err)
+	// Split-count storage merges against the locked current row. Reusing the
+	// earlier read here would overwrite a newer count during an embedding patch.
+	handled := false
+	validationStatus := 0
+	if patcher, ok := s.DataClient.(data.AtomicItemLabelPatcher); ok {
+		var current data.Item
+		current, handled, err = patcher.PatchItemLabelsAtomic(ctx, itemId, patch, func(actual data.Item) error {
+			if validationError := s.checkLabelsSize(actual.Labels); validationError != nil {
+				validationStatus = 429
+				return validationError
+			}
+			if validationError := s.validateItemEmbeddings([]data.Item{actual}); validationError != nil {
+				validationStatus = 400
+				return validationError
+			}
+			return nil
+		})
+		if handled && err == nil {
+			item = current
+		}
+	}
+	if !handled {
+		err = s.DataClient.ModifyItem(ctx, itemId, data.ItemPatch{Labels: merged})
+	}
+	if err != nil {
+		if errors.Is(err, storage.ErrNotFound) {
+			LabelPatchTotal.WithLabelValues("not_found").Inc()
+			PageNotFound(response, err)
+		} else if validationStatus == 429 {
+			LabelPatchTotal.WithLabelValues("rejected").Inc()
+			TooManyRequests(response, err)
+		} else if validationStatus == 400 {
+			LabelPatchTotal.WithLabelValues("rejected").Inc()
+			BadRequest(response, err)
+		} else {
+			LabelPatchTotal.WithLabelValues("error").Inc()
+			InternalServerError(response, err)
+		}
 		return
+	}
+	if handled {
+		refreshCtx, cancelRefresh := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancelRefresh()
+		ctx = refreshCtx
 	}
 	if err = s.CacheClient.Set(ctx, cache.Time(cache.Key(cache.LastModifyItemTime, itemId), time.Now())); err != nil {
 		LabelPatchTotal.WithLabelValues("error").Inc()

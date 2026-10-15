@@ -52,6 +52,9 @@ func init() {
 	Register([]string{storage.MySQLPrefix}, func(path, tablePrefix string, opts ...storage.Option) (Database, error) {
 		name := path[len(storage.MySQLPrefix):]
 		option := storage.NewOptions(opts...)
+		if option.SeparateTwitchViewCounts && option.IsolationLevel != "READ-COMMITTED" && option.IsolationLevel != "REPEATABLE-READ" && option.IsolationLevel != "SERIALIZABLE" {
+			return nil, errors.New("separate Twitch view counts require READ-COMMITTED or stronger session isolation")
+		}
 		// probe isolation variable name
 		isolationVarName, err := storage.ProbeMySQLIsolationVariableName(name)
 		if err != nil {
@@ -68,6 +71,7 @@ func init() {
 		// connect to database
 		database := new(SQLDatabase)
 		database.driver = MySQL
+		database.separateTwitchViewCounts = option.SeparateTwitchViewCounts
 		database.TablePrefix = storage.TablePrefix(tablePrefix)
 		if database.client, err = otelsql.Open("mysql", name,
 			otelsql.WithAttributes(semconv.DBSystemMySQL),
@@ -246,10 +250,11 @@ func FeedbackTypeExpressionToSQL(db *gorm.DB, e expression.FeedbackTypeExpressio
 // SQLDatabase use MySQL as data storage.
 type SQLDatabase struct {
 	storage.TablePrefix
-	gormDB       *gorm.DB
-	client       *sql.DB
-	driver       SQLDriver
-	searchVector string
+	gormDB                   *gorm.DB
+	client                   *sql.DB
+	driver                   SQLDriver
+	searchVector             string
+	separateTwitchViewCounts bool
 }
 
 const (
@@ -306,6 +311,11 @@ func (d *SQLDatabase) Init() error {
 		err := d.gormDB.Set("gorm:table_options", "ENGINE=InnoDB").AutoMigrate(Users{}, Items{}, Feedback{})
 		if err != nil {
 			return errors.WithStack(err)
+		}
+		if d.separateTwitchViewCounts {
+			if err = d.initItemViewCounts(); err != nil {
+				return errors.WithStack(err)
+			}
 		}
 	case Postgres:
 		// create tables
@@ -481,6 +491,13 @@ func (d *SQLDatabase) Ping() error {
 
 // Reconcile reconciles tables and indices in SQL databases.
 func (d *SQLDatabase) Reconcile(searchConfig config.SearchConfig) error {
+	if d.separateTwitchViewCounts {
+		for _, column := range searchConfig.Columns {
+			if column == "item.Labels" || column == "item.Labels.viewCount" || strings.HasPrefix(column, "item.Labels.viewCount.") {
+				return errors.New("split Twitch counts cannot be indexed as full-label or viewCount text; use explicit stable search columns")
+			}
+		}
+	}
 	if len(searchConfig.Columns) == 0 {
 		return nil
 	}
@@ -928,6 +945,9 @@ func (d *SQLDatabase) BatchInsertItems(ctx context.Context, items []Item) error 
 	if len(items) == 0 {
 		return nil
 	}
+	if d.separateTwitchViewCounts {
+		return errors.WithStack(d.insertItemsWithViewCounts(ctx, items))
+	}
 	if d.driver == ClickHouse {
 		rows := make([]ClickHouseItem, 0, len(items))
 		memo := mapset.NewSet[string]()
@@ -966,7 +986,7 @@ func (d *SQLDatabase) BatchGetItems(ctx context.Context, itemIds []string, opts 
 	if opts.ReturnId {
 		selectFields = "item_id"
 	} else {
-		selectFields = "item_id, is_hidden, categories, time_stamp, labels, comment"
+		selectFields = d.itemSelectColumns()
 	}
 	query := d.gormDB.WithContext(ctx).
 		Table(d.ItemsTable()).
@@ -1039,7 +1059,7 @@ func (d *SQLDatabase) GetItem(ctx context.Context, itemId string) (Item, error) 
 	var err error
 	result, err = d.gormDB.WithContext(ctx).
 		Table(d.ItemsTable()).
-		Select("item_id, is_hidden, categories, time_stamp, labels, comment").
+		Select(d.itemSelectColumns()).
 		Where("item_id = ?", itemId).Rows()
 	if err != nil {
 		return Item{}, errors.WithStack(err)
@@ -1080,7 +1100,7 @@ func (d *SQLDatabase) SearchItems(ctx context.Context, query string, n int) ([]S
 	case MySQL:
 		tx = d.gormDB.WithContext(ctx).
 			Table(d.ItemsTable()).
-			Select(fmt.Sprintf("item_id, is_hidden, categories, time_stamp, labels, comment, MATCH(%s) AGAINST (? IN NATURAL LANGUAGE MODE) AS score", mysqlSearchDocumentColumn), query).
+			Select(fmt.Sprintf("%s, MATCH(%s) AGAINST (? IN NATURAL LANGUAGE MODE) AS score", d.itemSelectColumns(), mysqlSearchDocumentColumn), query).
 			Where(fmt.Sprintf("MATCH(%s) AGAINST (? IN NATURAL LANGUAGE MODE)", mysqlSearchDocumentColumn), query).
 			Order(clause.Expr{SQL: fmt.Sprintf("MATCH(%s) AGAINST (? IN NATURAL LANGUAGE MODE) DESC", mysqlSearchDocumentColumn), Vars: []any{query}}).
 			Limit(n)
@@ -1123,6 +1143,13 @@ func (d *SQLDatabase) SearchItems(ctx context.Context, query string, n int) ([]S
 
 // ModifyItem modify an item in MySQL.
 func (d *SQLDatabase) ModifyItem(ctx context.Context, itemId string, patch ItemPatch) error {
+	if d.separateTwitchViewCounts && patch.Labels != nil {
+		return errors.WithStack(d.modifyItemWithViewCount(ctx, itemId, patch))
+	}
+	return d.modifyItemColumns(d.gormDB.WithContext(ctx), itemId, patch)
+}
+
+func (d *SQLDatabase) modifyItemColumns(tx *gorm.DB, itemId string, patch ItemPatch) error {
 	// ignore empty patch
 	if patch.IsHidden == nil && patch.Categories == nil && patch.Labels == nil && patch.Comment == nil && patch.Timestamp == nil {
 		log.Logger().Debug("empty item patch")
@@ -1150,7 +1177,7 @@ func (d *SQLDatabase) ModifyItem(ctx context.Context, itemId string, patch ItemP
 	if patch.Timestamp != nil {
 		attributes["time_stamp"] = d.normalizeTimestampForWrite(*patch.Timestamp)
 	}
-	err := d.gormDB.WithContext(ctx).Model(&SQLItem{ItemId: itemId}).Updates(attributes).Error
+	err := tx.Model(&SQLItem{ItemId: itemId}).Updates(attributes).Error
 	return errors.WithStack(err)
 }
 
@@ -1163,7 +1190,7 @@ func (d *SQLDatabase) GetItems(ctx context.Context, cursor string, n int, timeLi
 	cursorItem := string(buf)
 	tx := d.gormDB.WithContext(ctx).
 		Table(d.ItemsTable()).
-		Select("item_id, is_hidden, categories, time_stamp, labels, comment")
+		Select(d.itemSelectColumns())
 	if cursorItem != "" {
 		tx.Where("item_id >= ?", cursorItem)
 	}
@@ -1199,7 +1226,7 @@ func (d *SQLDatabase) GetLatestItems(ctx context.Context, n int, categories []st
 	}
 	tx := d.gormDB.WithContext(ctx).
 		Table(tableName).
-		Select("item_id, is_hidden, categories, time_stamp, labels, comment").
+		Select(d.itemSelectColumns()).
 		Where("is_hidden = ?", false)
 	if len(categories) > 0 {
 		q, err := jsonutil.Marshal(categories)
@@ -1244,7 +1271,7 @@ func (d *SQLDatabase) GetItemStream(ctx context.Context, batchSize int, timeLimi
 		// send query
 		tx := d.gormDB.WithContext(ctx).
 			Table(d.ItemsTable()).
-			Select("item_id, is_hidden, categories, time_stamp, labels, comment")
+			Select(d.itemSelectColumns())
 		if timeLimit != nil {
 			tx.Where("time_stamp >= ?", *timeLimit)
 		}
