@@ -136,6 +136,12 @@ force normalization even if an old projection fingerprint still exists.
 
 ## Rollout gates
 
+The fixed zero-valued metric series appear even when the split is OFF; their
+presence is not activation evidence. Counters cover unique items in batch
+inserts, not independent label patches or ModifyItem calls. Sum windowed
+increases across processes and account for restart resets; a crash after commit
+can conservatively undercount committed decisions.
+
 Compatible readers, isolation/search validation, a restored complete backup and
 the rollback rehearsal are prerequisites to a separately approved bounded
 production trial. Actual eligibility and paired write measurements are then

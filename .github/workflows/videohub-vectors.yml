@@ -124,13 +124,17 @@ jobs:
           go-version-file: go.mod
           cache: true
       - name: Start an isolated, named MySQL 8.0.32 container
+        env:
+          MYSQL_PWD: isolated-test-password
         run: |
           docker run -d --name vh-count-tests-ci -p 127.0.0.1:3306:3306 \
             -e MYSQL_ROOT_PASSWORD=isolated-test-password -e MYSQL_DATABASE=gorse_counts_test mysql:8.0.32
+          ready=0
           for i in $(seq 1 40); do
-            docker exec vh-count-tests-ci mysqladmin ping --silent -pisolated-test-password && break
+            if docker exec -e MYSQL_PWD vh-count-tests-ci mysql --protocol=TCP --host=127.0.0.1 --user=root --batch --skip-column-names --execute='SELECT 1' >/dev/null 2>&1; then ready=1; break; fi
             sleep 3
           done
+          test "$ready" = 1 || { echo 'Isolated MySQL did not become authenticated TCP-ready'; exit 1; }
       - name: Run the paired logical/redo/kernel-block write experiment
         env:
           TWITCH_COUNT_MYSQL_URI: mysql://root:isolated-test-password@tcp(127.0.0.1:3306)/gorse_counts_test
