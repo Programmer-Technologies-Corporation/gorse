@@ -138,6 +138,7 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 			break
 		}
 	}
+	decisions := viewCountDecisions{}
 	if !containsTwitchLive {
 		rows := make([]SQLItem, 0, len(ids))
 		for _, id := range ids {
@@ -145,7 +146,8 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 			row.Timestamp = d.normalizeTimestampForWrite(row.Timestamp)
 			rows = append(rows, row)
 		}
-		return d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+		decisions.evaluate(ViewCountBranchUnsplittable, len(ids))
+		err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 			if err := tx.Clauses(clause.OnConflict{
 				Columns:   []clause.Column{{Name: "item_id"}},
 				DoUpdates: clause.AssignmentColumns([]string{"is_hidden", "categories", "time_stamp", "labels", "comment"}),
@@ -154,8 +156,13 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 			}
 			return tx.Table(d.itemViewCountsTable()).Where("item_id IN ?", ids).Delete(&sqlItemViewCount{}).Error
 		})
+		if err != nil {
+			return err
+		}
+		decisions.committed()
+		return nil
 	}
-	return d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, id := range ids {
 			cold, count, err := splitTwitchViewCount(unique[id])
 			if err != nil {
@@ -169,28 +176,30 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 				return err
 			}
 			fingerprint := sha256.Sum256(encoded)
+			state := viewCountWriteState{marked: IsTwitchLiveProjection(ctx), splittable: count != nil}
 			var current SQLItem
 			err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("item_id = ?", id).Take(&current).Error
-			exists := err == nil
+			state.exists = err == nil
 			if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 				return err
 			}
-			var previous sqlItemViewCount
-			sameProjection := false
-			if exists && count != nil {
+			if state.exists && count != nil {
+				var previous sqlItemViewCount
 				err = tx.Table(d.itemViewCountsTable()).Where("item_id = ?", id).Take(&previous).Error
 				if err != nil && !errors.Is(err, gorm.ErrRecordNotFound) {
 					return err
 				}
-				sameProjection = IsTwitchLiveProjection(ctx) && err == nil && bytes.Equal(previous.ProjectionHash, fingerprint[:])
+				state.countRow = err == nil
+				state.sameFingerprint = state.countRow && bytes.Equal(previous.ProjectionHash, fingerprint[:])
 				var currentLabels map[string]any
 				if json.Unmarshal([]byte(current.Labels), &currentLabels) == nil {
-					if _, legacyCount := currentLabels["viewCount"]; legacyCount {
-						sameProjection = false
-					}
+					_, state.legacyLabel = currentLabels["viewCount"]
 				}
 			}
-			if !sameProjection {
+			// The branch is the decision: only the short path skips the item row.
+			branch := classifyViewCountWrite(state)
+			decisions.evaluate(branch, 1)
+			if branch != ViewCountBranchShortPath {
 				if err = tx.Clauses(clause.OnConflict{
 					Columns:   []clause.Column{{Name: "item_id"}},
 					DoUpdates: clause.AssignmentColumns([]string{"is_hidden", "categories", "time_stamp", "labels", "comment"}),
@@ -204,6 +213,11 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 		}
 		return nil
 	})
+	if err != nil {
+		return err
+	}
+	decisions.committed()
+	return nil
 }
 
 func (d *SQLDatabase) modifyItemWithViewCount(ctx context.Context, itemId string, patch ItemPatch) error {

@@ -33,6 +33,8 @@ on:
       - go.mod
       - go.sum
       - .github/workflows/videohub-vectors.yml
+  # Manual trigger for the synthetic paired write experiment below.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -90,8 +92,57 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - name: Test MySQL upgrade, reader parity, atomic projection and concurrent labels
+      - name: Test MySQL upgrade, reader parity, atomic projection, decision counters and concurrent labels
         env:
           MYSQL_URI: mysql://root:isolated-test-password@tcp(127.0.0.1:3306)/
           TWITCH_COUNT_MYSQL_URI: mysql://root:isolated-test-password@tcp(127.0.0.1:3306)/gorse_counts_test
         run: go test -race ./storage/data ./server ./config ./model/ctr -count=1 -timeout=10m
+      # Real mysqldump/restore of all data tables into a uniquely named synthetic
+      # database on the isolated service container. The explicit -run and -v
+      # make a skip or missing client tool visible instead of silent.
+      - name: Test isolated mysqldump backup, restore, readers and rollback copy-back
+        env:
+          TWITCH_COUNT_BACKUP_MYSQL_URI: mysql://root:isolated-test-password@tcp(127.0.0.1:3306)/gorse_counts_test
+          TWITCH_COUNT_BACKUP_TOOL_CONTAINER: vh-count-tests-backup-ci
+        run: |
+          set -o pipefail
+          docker rename "${{ job.services.mysql.id }}" vh-count-tests-backup-ci
+          docker exec vh-count-tests-backup-ci mysqldump --version
+          go test -race ./storage/data -run '^TestMySQLTwitchViewCountsBackupRestore$' -count=1 -timeout=5m -v | tee backup-test.log
+          grep -q -- '--- PASS: TestMySQLTwitchViewCountsBackupRestore' backup-test.log
+
+  # Synthetic write experiment for this PR: not a production load test. It needs a
+  # named disposable container so cgroup block counters can be read.
+  twitch_view_count_write_experiment:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Start an isolated, named MySQL 8.0.32 container
+        run: |
+          docker run -d --name vh-count-tests-ci -p 127.0.0.1:3306:3306 \
+            -e MYSQL_ROOT_PASSWORD=isolated-test-password -e MYSQL_DATABASE=gorse_counts_test mysql:8.0.32
+          for i in $(seq 1 40); do
+            docker exec vh-count-tests-ci mysqladmin ping --silent -pisolated-test-password && break
+            sleep 3
+          done
+      - name: Run the paired logical/redo/kernel-block write experiment
+        env:
+          TWITCH_COUNT_MYSQL_URI: mysql://root:isolated-test-password@tcp(127.0.0.1:3306)/gorse_counts_test
+          TWITCH_COUNT_BENCH_CONTAINER: vh-count-tests-ci
+          TWITCH_COUNT_BENCH_OUTPUT: ${{ runner.temp }}/twitch-count-write-volume.json
+        run: go test ./storage/data -run '^TestMySQLTwitchViewCountWriteVolume$' -count=1 -timeout=25m -v
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: twitch-count-write-volume
+          path: ${{ runner.temp }}/twitch-count-write-volume.json
+          if-no-files-found: error
+      - name: Remove the disposable container
+        if: always()
+        run: docker rm -f vh-count-tests-ci

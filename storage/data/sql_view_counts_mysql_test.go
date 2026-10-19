@@ -16,8 +16,49 @@ import (
 	"github.com/gorse-io/gorse/model/ctr"
 	"github.com/gorse-io/gorse/storage"
 	"github.com/gorse-io/gorse/storage/data"
+	"github.com/prometheus/client_golang/prometheus"
+	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/require"
 )
+
+// branchCounts snapshots a branch counter vector without prometheus/testutil.
+func branchCounts(t *testing.T, vec *prometheus.CounterVec) map[string]float64 {
+	t.Helper()
+	out := make(map[string]float64, len(data.ViewCountBranches))
+	for _, branch := range data.ViewCountBranches {
+		var metric dto.Metric
+		require.NoError(t, vec.WithLabelValues(branch).Write(&metric))
+		out[branch] = metric.Counter.GetValue()
+	}
+	return out
+}
+
+// countDecisions runs fn and returns the nonzero evaluated and committed
+// branch deltas it produced, so a failed transaction is visibly uncommitted.
+func countDecisions(t *testing.T, fn func()) (evaluated, committed map[string]float64) {
+	t.Helper()
+	beforeEvaluated, beforeCommitted := branchCounts(t, data.TwitchViewCountDecisionsTotal), branchCounts(t, data.TwitchViewCountCommitsTotal)
+	fn()
+	evaluated, committed = map[string]float64{}, map[string]float64{}
+	for branch, after := range branchCounts(t, data.TwitchViewCountDecisionsTotal) {
+		if delta := after - beforeEvaluated[branch]; delta != 0 {
+			evaluated[branch] = delta
+		}
+	}
+	for branch, after := range branchCounts(t, data.TwitchViewCountCommitsTotal) {
+		if delta := after - beforeCommitted[branch]; delta != 0 {
+			committed[branch] = delta
+		}
+	}
+	return evaluated, committed
+}
+
+func expectBranch(t *testing.T, branch string, fn func()) {
+	t.Helper()
+	evaluated, committed := countDecisions(t, fn)
+	require.Equal(t, map[string]float64{branch: 1}, evaluated)
+	require.Equal(t, map[string]float64{branch: 1}, committed)
+}
 
 func countFixture(t *testing.T) (data.Database, data.Database, *sql.DB, string) {
 	t.Helper()
@@ -274,4 +315,115 @@ func TestMySQLTwitchViewCountsPreserveConcurrentLabelsAndTransitions(t *testing.
 	current, err = db.GetItem(ctx, "live")
 	require.NoError(t, err)
 	require.NotContains(t, current.Labels, "viewCount")
+}
+
+func TestMySQLTwitchViewCountsDecisionCounters(t *testing.T) {
+	ctx := context.Background()
+	legacy, db, sqlDB, prefix := countFixture(t)
+	require.NoError(t, db.Init())
+	marked := data.WithTwitchLiveProjection(ctx)
+	labelPresent := func(id string) int {
+		var present int
+		require.NoError(t, sqlDB.QueryRow("SELECT JSON_CONTAINS_PATH(labels,'one','$.viewCount') FROM "+prefix+"items WHERE item_id=?", id).Scan(&present))
+		return present
+	}
+
+	// The default writer (split OFF) never touches the counters.
+	evaluated, committed := countDecisions(t, func() {
+		require.NoError(t, legacy.BatchInsertItems(marked, []data.Item{liveItem("legacy", 10)}))
+	})
+	require.Empty(t, evaluated)
+	require.Empty(t, committed)
+
+	expectBranch(t, data.ViewCountBranchMissingItem, func() {
+		require.NoError(t, db.BatchInsertItems(marked, []data.Item{liveItem("live", 1000)}))
+	})
+	expectBranch(t, data.ViewCountBranchShortPath, func() {
+		require.NoError(t, db.BatchInsertItems(marked, []data.Item{liveItem("live", 1001)}))
+	})
+	// An independent embedding patch keeps the source fingerprint, so the next
+	// count-only projection is still short-path eligible and keeps the patch.
+	patcher := db.(data.AtomicItemLabelPatcher)
+	_, handled, err := patcher.PatchItemLabelsAtomic(ctx, "live", map[string]any{"embedding": []float64{.75, .875}}, func(data.Item) error { return nil })
+	require.True(t, handled)
+	require.NoError(t, err)
+	expectBranch(t, data.ViewCountBranchShortPath, func() {
+		require.NoError(t, db.BatchInsertItems(marked, []data.Item{liveItem("live", 1002)}))
+	})
+	current, err := db.GetItem(ctx, "live")
+	require.NoError(t, err)
+	require.Equal(t, float64(1002), viewCount(t, current))
+	require.Equal(t, []any{.75, .875}, current.Labels.(map[string]any)["embedding"])
+
+	// Changed lifecycle/safety metadata forces a full write under the marker.
+	offline := liveItem("live", 1003)
+	offline.IsHidden = true
+	offline.Comment = "offline"
+	expectBranch(t, data.ViewCountBranchFullChangedSource, func() {
+		require.NoError(t, db.BatchInsertItems(marked, []data.Item{offline}))
+	})
+	current, err = db.GetItem(ctx, "live")
+	require.NoError(t, err)
+	require.True(t, current.IsHidden)
+	// The same source without the marker is an ordinary full replacement.
+	expectBranch(t, data.ViewCountBranchUnmarked, func() {
+		require.NoError(t, db.BatchInsertItems(ctx, []data.Item{offline}))
+	})
+
+	// First touch of a legacy row converts it even though it is marked.
+	require.Equal(t, 1, labelPresent("legacy"))
+	expectBranch(t, data.ViewCountBranchLegacyConversion, func() {
+		require.NoError(t, db.BatchInsertItems(marked, []data.Item{liveItem("legacy", 11)}))
+	})
+	require.Zero(t, labelPresent("legacy"))
+	_, err = sqlDB.Exec("DELETE FROM " + prefix + "item_view_counts WHERE item_id='legacy'")
+	require.NoError(t, err)
+	expectBranch(t, data.ViewCountBranchMissingCount, func() {
+		require.NoError(t, db.BatchInsertItems(marked, []data.Item{liveItem("legacy", 12)}))
+	})
+	current, err = db.GetItem(ctx, "legacy")
+	require.NoError(t, err)
+	require.Equal(t, float64(12), viewCount(t, current))
+
+	// Other providers and invalid counts in a mixed batch are unsplittable;
+	// a batch without any Twitch live item takes the bulk path per item.
+	youtube := liveItem("yt", 5)
+	youtube.Labels.(map[string]any)["platform"] = "youtube"
+	invalid := liveItem("bad", 0)
+	invalid.Labels.(map[string]any)["viewCount"] = "not a number"
+	evaluated, committed = countDecisions(t, func() {
+		require.NoError(t, db.BatchInsertItems(ctx, []data.Item{youtube, invalid, liveItem("legacy", 12)}))
+	})
+	require.Equal(t, map[string]float64{data.ViewCountBranchUnsplittable: 2, data.ViewCountBranchUnmarked: 1}, evaluated)
+	require.Equal(t, evaluated, committed)
+	evaluated, committed = countDecisions(t, func() {
+		other := youtube
+		other.ItemId = "yt2"
+		require.NoError(t, db.BatchInsertItems(ctx, []data.Item{youtube, other}))
+	})
+	require.Equal(t, map[string]float64{data.ViewCountBranchUnsplittable: 2}, evaluated)
+	require.Equal(t, evaluated, committed)
+
+	// A rolled-back transaction is evaluated but never committed, including a
+	// short-path item that shared the transaction with the failing one.
+	_, err = sqlDB.Exec("ALTER TABLE " + prefix + "item_view_counts ADD CHECK (view_count < 50000)")
+	require.NoError(t, err)
+	failing := liveItem("live", 50000)
+	failing.Comment = "changed"
+	evaluated, committed = countDecisions(t, func() {
+		require.Error(t, db.BatchInsertItems(marked, []data.Item{failing}))
+	})
+	require.Equal(t, map[string]float64{data.ViewCountBranchFullChangedSource: 1}, evaluated)
+	require.Empty(t, committed)
+	evaluated, committed = countDecisions(t, func() {
+		require.Error(t, db.BatchInsertItems(marked, []data.Item{offline, liveItem("zz", 60000)}))
+	})
+	require.Equal(t, map[string]float64{data.ViewCountBranchShortPath: 1, data.ViewCountBranchMissingItem: 1}, evaluated)
+	require.Empty(t, committed)
+	current, err = db.GetItem(ctx, "live")
+	require.NoError(t, err)
+	require.Equal(t, "offline", current.Comment)
+	require.Equal(t, float64(1003), viewCount(t, current))
+	_, err = db.GetItem(ctx, "zz")
+	require.ErrorIs(t, err, storage.ErrNotFound)
 }
