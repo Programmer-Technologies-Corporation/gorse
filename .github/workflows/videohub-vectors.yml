@@ -84,19 +84,32 @@ jobs:
         ports:
           - 3306:3306
         options: >-
-          --health-cmd="mysqladmin ping -h localhost -pisolated-test-password"
+          --health-cmd="MYSQL_PWD=isolated-test-password mysql --protocol=TCP --host=127.0.0.1 --user=root --batch --skip-column-names --execute='SELECT 1'"
           --health-interval=5s --health-timeout=5s --health-retries=20
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
           cache: true
-      - name: Test MySQL upgrade, reader parity, atomic projection, decision counters and concurrent labels
+      - name: Prepare the isolated MySQL visibility fixture
+        env:
+          MYSQL_PWD: isolated-test-password
+        run: >-
+          docker exec -e MYSQL_PWD "${{ job.services.mysql.id }}"
+          mysql --user=root --execute='CREATE DATABASE gorse_visibility_ci CHARACTER SET utf8mb4'
+      - name: Test MySQL upgrade, visibility, mixed rollback, reader parity and concurrent labels
         env:
           MYSQL_URI: mysql://root:isolated-test-password@tcp(127.0.0.1:3306)/
           TWITCH_COUNT_MYSQL_URI: mysql://root:isolated-test-password@tcp(127.0.0.1:3306)/gorse_counts_test
-        run: go test -race ./storage/data ./server ./config ./model/ctr -count=1 -timeout=10m
+          GORSE_VISIBILITY_MYSQL_URI: mysql://root:isolated-test-password@tcp(127.0.0.1:3306)/gorse_visibility_ci
+        run: |
+          set -o pipefail
+          go test -race ./storage/data ./server ./config ./model/ctr -count=1 -timeout=10m -v | tee mysql-tests.log
+          grep -q -- '--- PASS: TestFilterVisibleItemsEquivalence/mysql ' mysql-tests.log
+          grep -q -- '--- PASS: TestMySQLTwitchViewCountsRollbackMixedRepresentations ' mysql-tests.log
       # Real mysqldump/restore of all data tables into a uniquely named synthetic
       # database on the isolated service container. The explicit -run and -v
       # make a skip or missing client tool visible instead of silent.
@@ -119,6 +132,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
