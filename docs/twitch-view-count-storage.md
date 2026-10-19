@@ -136,9 +136,11 @@ force normalization even if an old projection fingerprint still exists.
 
 ## Rollout gates
 
-Each gate must be satisfied, in order, before the separate production
-activation decision. None of them is satisfied by this document or by passing
-tests alone.
+Compatible readers, isolation/search validation, a restored complete backup and
+the rollback rehearsal are prerequisites to a separately approved bounded
+production trial. Actual eligibility and paired write measurements are then
+acceptance gates during that trial, before confirming the release. Passing
+isolated tests does not establish these production results.
 
 1. Every master, server and worker that reads items directly from MySQL runs
    a storage-aware binary; no old direct-MySQL reader remains.
@@ -161,7 +163,8 @@ tests alone.
 ## Verification tools
 
 The backup regression skips unless `TWITCH_COUNT_BACKUP_MYSQL_URI` is set. The
-URI must point at loopback and name a synthetic database; the test dumps only
+URI must point at loopback and name `gorse_counts_test`; the tool's server UUID
+must match the Go connection before fixture creation. The test dumps only
 its own prefixed tables with `mysqldump`, restores them into a uniquely named
 `vc_backup_*` database it creates and drops itself, and never prints
 credentials or dump contents. Set `TWITCH_COUNT_BACKUP_TOOL_CONTAINER` to a
@@ -173,8 +176,8 @@ runs it against its isolated MySQL 8.0.32 service and fails if it is skipped.
 
 The write experiment needs `TWITCH_COUNT_BENCH_OUTPUT`,
 `TWITCH_COUNT_BENCH_CONTAINER` (a `vh-count-tests-*` container) and optionally
-`TWITCH_COUNT_BENCH_DOCKER_CONTEXT`. The focused workflow exposes it as a
-manually dispatched job that starts and removes its own named container. Each
+`TWITCH_COUNT_BENCH_DOCKER_CONTEXT`. The focused workflow runs it for pull
+requests and manual dispatch, starting and removing its own named container. Each
 arm's receipt now includes the committed branch counters; a split arm is only
 accepted when all 1,000 writes took `short_path`.
 
