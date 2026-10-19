@@ -67,6 +67,10 @@ FM converter's scalar branch accepts json.Number. This pre-existing training
 representation mismatch is not changed here. The optimization neither removes
 the label nor silently changes model feature conversion or ranking weights.
 It would be incorrect to claim this PR fixes that separate modeling issue.
+Explicit-null map entries also reset the existing converters' accumulated
+features, making their output map-order dependent. Mixed rollback tests verify
+the exact raw/public null representation; feature and embedding parity uses the
+deterministic non-null fixtures. This pre-existing converter behavior is unchanged.
 
 ## Decision counters
 
@@ -110,6 +114,22 @@ Preparation and review do not authorize production activation.
    components consistently (restart connections; do not rely on hot reload), and start the new master to create/verify the small
    table before starting workers and servers. Do not leave old direct-MySQL
    readers active once counts begin moving out of labels.
+   If a retained count table exists, with writers quiesced immediately before
+   enabling require zero joined rows with object labels missing `viewCount`
+   while the layout is still OFF:
+
+   ```sql
+   SELECT COUNT(*) FROM items AS i JOIN item_view_counts AS c ON i.item_id = c.item_id
+   WHERE JSON_TYPE(i.labels) = 'OBJECT'
+     AND NOT JSON_CONTAINS_PATH(i.labels, 'one', '$.viewCount');
+   ```
+
+   Retain shadow count rows when legacy keys exist: legacy labels win and a later
+   projection converts them from the authoritative source. If the check is not
+   zero, stop and reconcile the source; do not enable with stale keyless rows,
+   guess their values, delete the table or blindly copy retained counts back.
+   Verify `items.item_id` and `item_view_counts.item_id` have compatible type,
+   character set and collation and that the cascade foreign key is intact.
 4. Resume consumers and verify a real live count, hidden/offline transitions,
    pending repair and training/reader parity. Allow first-touch conversion to
    settle before measuring steady-state write volume.
@@ -142,7 +162,15 @@ non-object labels keep the reader's existing fallback behavior. Keep all writers
 quiesced through copy-back and disabling the feature on all components, before
 resuming old binaries. Preserve the small table and backup;
 do not drop data during rollback. Re-enabling is tested: legacy count labels
-force normalization even if an old projection fingerprint still exists.
+force normalization even if an old projection fingerprint still exists. That
+normalization uses a complete source projection; independent labels omitted by
+that source can be replaced, as with an ordinary full write.
+
+A projection can return an HTTP error after its SQL transaction committed if
+the required post-commit read/cache refresh fails. Treat that outcome as possibly
+persisted and retry idempotently through the durable projection flow. The OFF
+comparison arm on the compatible binaries also performs the marked projection's
+serialization and post-commit re-read; it is not the cost of the old binaries.
 
 ## Rollout gates
 
