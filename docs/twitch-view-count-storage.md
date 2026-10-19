@@ -119,18 +119,28 @@ unsupported: old readers cannot reconstruct a moved label. Use the coordinated
 cutover above. This is a storage-layout compatibility boundary, even though
 HTTP DTOs remain compatible.
 
-For separately approved rollback, stop writers first and copy every hot value
-back into labels in a transaction, using the actual verified table prefix:
+For separately approved rollback, stop all writers and readers first. Copy back
+only values whose object labels no longer contain `viewCount`, using the actual
+verified table prefix. A retained count row can be stale after an earlier
+rollback; an existing legacy key (even JSON null or zero) remains authoritative.
+Do not overwrite it with a blanket join update.
 
 ```sql
 START TRANSACTION;
 UPDATE items AS i JOIN item_view_counts AS c ON i.item_id = c.item_id
-SET i.labels = JSON_SET(i.labels, '$.viewCount', c.view_count);
+SET i.labels = JSON_SET(i.labels, '$.viewCount', c.view_count)
+WHERE JSON_TYPE(i.labels) = 'OBJECT'
+  AND NOT JSON_CONTAINS_PATH(i.labels, 'one', '$.viewCount');
 COMMIT;
 ```
 
-Verify row coverage and numeric values, then disable the feature on all
-components before resuming old binaries. Preserve the small table and backup;
+Pre-count the eligible joined rows and verify the affected row count, numeric
+JSON type, zero remaining converted rows and unchanged labels for excluded
+items. Verify split-reader versus old-reader parity, including embeddings and
+FM features, on the restored copy before the trial. Missing count rows and
+non-object labels keep the reader's existing fallback behavior. Keep all writers
+quiesced through copy-back and disabling the feature on all components, before
+resuming old binaries. Preserve the small table and backup;
 do not drop data during rollback. Re-enabling is tested: legacy count labels
 force normalization even if an old projection fingerprint still exists.
 
@@ -195,7 +205,9 @@ patches, failed-write rollback/retry, legacy patch conversion, null deletion,
 missing item/count healing, delete cascade and rollback/re-enable.
 
 `TestMySQLTwitchViewCountWriteVolume` calls the actual SQLDatabase implementation
-for 1,000 updates per arm. Both 8.0.32 and 8.0.46 produced 9,332,000 binlog bytes
+for 1,000 updates per arm. Its current vector fixture uses the production
+configuration's 256 dimensions; other metadata and traffic remain synthetic.
+The historical 384-dimensional fixture on 8.0.32 and 8.0.46 produced 9,332,000 binlog bytes
 for the old layout and 502,000 for the split layout (94.62% reduction); both
 emitted zero for identical updates. Local kernel virtual-disk block-write
 reductions were approximately 8.5–14% in the repeated changed-count arms, and

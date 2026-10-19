@@ -103,7 +103,9 @@ func TestMySQLTwitchViewCountWriteVolume(t *testing.T) {
 	require.Empty(t, partial)
 	require.Zero(t, compression)
 	random := rand.New(rand.NewSource(4))
-	vector := make([]float64, 384)
+	// Match the production configuration inspected for this trial. The remaining
+	// item metadata and traffic are synthetic, not a production replay.
+	vector := make([]float64, 256)
 	for i := range vector {
 		vector[i] = math.Round((random.Float64()*2-1)*1e7) / 1e7
 	}
@@ -192,7 +194,7 @@ func TestMySQLTwitchViewCountWriteVolume(t *testing.T) {
 		results = append(results, result{mode, 1000, seconds, after.Position - before.Position, before, after, len(items), committed})
 		t.Logf("%s: %d binlog bytes over 1000 actual datastore writes", mode, after.Position-before.Position)
 	}
-	receipt := map[string]any{"mysql_version": version, "binlog_format": format, "binlog_row_image": image, "partial_json": partial, "compression": compression, "items": 100, "embedding_dimensions": 384, "results": results,
+	receipt := map[string]any{"mysql_version": version, "binlog_format": format, "binlog_row_image": image, "partial_json": partial, "compression": compression, "items": 100, "embedding_dimensions": len(vector), "results": results,
 		"coverage": "Synthetic items against actual Gorse SQLDatabase methods, not raw SQL emulation and not production data or traffic. Kernel counters measure the named container's virtual-disk block writes, not production EBS. HTTP, Redis cache and vector-index writes are excluded; seed conversion is excluded from every arm."}
 	encoded, err := json.MarshalIndent(receipt, "", "  ")
 	require.NoError(t, err)

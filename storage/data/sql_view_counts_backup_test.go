@@ -168,6 +168,10 @@ func TestMySQLTwitchViewCountsBackupRestore(t *testing.T) {
 	// item, an unsplittable VOD, plus a user and feedback for the other tables.
 	timestamp := time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
 	require.NoError(t, legacy.BatchInsertItems(ctx, []data.Item{liveItem("legacy", 42)}))
+	// A previous partial rollout can leave a stale count beside authoritative
+	// legacy labels. Include it in the actual dump and restore, not just a unit fixture.
+	_, err = admin.Exec("INSERT INTO " + prefix + "item_view_counts (item_id,view_count) VALUES ('legacy',7)")
+	require.NoError(t, err)
 	require.NoError(t, source.BatchInsertItems(marked, []data.Item{liveItem("live", 8731)}))
 	vod := liveItem("vod", 7)
 	vod.Labels.(map[string]any)["externalKind"] = "Video"
@@ -224,7 +228,7 @@ func TestMySQLTwitchViewCountsBackupRestore(t *testing.T) {
 	var constraints int
 	require.NoError(t, admin.QueryRow("SELECT COUNT(*) FROM information_schema.REFERENTIAL_CONSTRAINTS WHERE CONSTRAINT_SCHEMA=? AND TABLE_NAME=?", synthetic, prefix+"item_view_counts").Scan(&constraints))
 	require.Equal(t, 1, constraints, "the cascade foreign key must survive dump and restore")
-	require.Equal(t, 1, countRows(), "only the converted live item owns a count row")
+	require.Equal(t, 2, countRows(), "both converted and retained legacy count rows survive restore")
 
 	// Every reader, the FM feature conversion and the embedding conversion see
 	// the pre-backup representation on the restored copy.
@@ -281,14 +285,19 @@ func TestMySQLTwitchViewCountsBackupRestore(t *testing.T) {
 	// labels, let a split-OFF reader verify them, and keep the count table.
 	split, err := restored.GetItem(ctx, "live")
 	require.NoError(t, err)
-	_, err = admin.Exec("UPDATE `" + synthetic + "`.`" + prefix + "items` i JOIN `" + synthetic + "`.`" + prefix + "item_view_counts` c ON i.item_id=c.item_id SET i.labels=JSON_SET(i.labels,'$.viewCount',c.view_count)")
+	legacyBefore, err := restored.GetItem(ctx, "legacy")
 	require.NoError(t, err)
+	require.Equal(t, int64(1), copyBackViewCounts(t, admin, "`"+synthetic+"`.`"+prefix+"items`", "`"+synthetic+"`.`"+prefix+"item_view_counts`"))
 	rolledBack, err := oldReader.GetItem(ctx, "live")
 	require.NoError(t, err)
 	require.Equal(t, float64(8732), viewCount(t, rolledBack))
 	require.Equal(t, split, rolledBack, "old and split readers agree after copy-back")
 	require.Equal(t, sortedFeatures(split.Labels), sortedFeatures(rolledBack.Labels))
-	require.Equal(t, 1, countRows(), "rollback preserves the count table")
+	legacyAfter, err := oldReader.GetItem(ctx, "legacy")
+	require.NoError(t, err)
+	require.Equal(t, legacyBefore, legacyAfter, "stale retained count cannot overwrite the authoritative legacy label")
+	require.Equal(t, float64(42), viewCount(t, legacyAfter))
+	require.Equal(t, 2, countRows(), "rollback preserves every count row")
 
 	// Re-enable: the legacy label forces normalization despite the old hash.
 	expectBranch(t, data.ViewCountBranchLegacyConversion, func() {
@@ -301,5 +310,5 @@ func TestMySQLTwitchViewCountsBackupRestore(t *testing.T) {
 	require.NoError(t, admin.QueryRow("SELECT JSON_CONTAINS_PATH(labels,'one','$.viewCount') FROM `"+synthetic+"`.`"+prefix+"items` WHERE item_id='live'").Scan(&present))
 	require.Zero(t, present)
 	require.NoError(t, restored.DeleteItem(ctx, "live"))
-	require.Zero(t, countRows(), "the restored cascade removes the count row")
+	require.Equal(t, 1, countRows(), "the restored cascade removes only the deleted item's count row")
 }

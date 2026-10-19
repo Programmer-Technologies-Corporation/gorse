@@ -99,6 +99,105 @@ func sortedFeatures(labels any) []ctr.Label {
 	return features
 }
 
+// Exercise the runbook operation on owned synthetic tables with writers quiet.
+// Table names are test-generated identifiers, already qualified when needed.
+func copyBackViewCounts(t *testing.T, client *sql.DB, itemsTable, countsTable string) int64 {
+	t.Helper()
+	tx, err := client.BeginTx(context.Background(), nil)
+	require.NoError(t, err)
+	defer tx.Rollback()
+	result, err := tx.Exec("UPDATE " + itemsTable + " i JOIN " + countsTable + " c ON i.item_id=c.item_id SET i.labels=JSON_SET(i.labels,'$.viewCount',c.view_count) WHERE JSON_TYPE(i.labels)='OBJECT' AND NOT JSON_CONTAINS_PATH(i.labels,'one','$.viewCount')")
+	require.NoError(t, err)
+	affected, err := result.RowsAffected()
+	require.NoError(t, err)
+	require.NoError(t, tx.Commit())
+	return affected
+}
+
+func TestMySQLTwitchViewCountsRollbackMixedRepresentations(t *testing.T) {
+	ctx := context.Background()
+	legacy, modern, client, prefix := countFixture(t)
+	require.NoError(t, modern.Init())
+	converted := liveItem("converted", 80)
+	require.NoError(t, modern.BatchInsertItems(data.WithTwitchLiveProjection(ctx), []data.Item{converted}))
+	// A concurrent enrichment can own a much larger independent embedding.
+	vector := make([]float64, 256)
+	for i := range vector {
+		vector[i] = float64(i) / 256
+	}
+	_, handled, err := modern.(data.AtomicItemLabelPatcher).PatchItemLabelsAtomic(ctx, "converted", map[string]any{"embedding": vector, "independent": true}, func(data.Item) error { return nil })
+	require.NoError(t, err)
+	require.True(t, handled)
+	untouched := liveItem("legacy", 42)
+	nullKey := liveItem("null-key", 0)
+	nullKey.Labels.(map[string]any)["viewCount"] = nil
+	zero := liveItem("zero", 0)
+	missing := liveItem("missing-count", 0)
+	delete(missing.Labels.(map[string]any), "viewCount")
+	array := liveItem("array", 0)
+	array.Labels = []any{"unrelated", "labels"}
+	jsonNull := liveItem("json-null", 0)
+	jsonNull.Labels = nil // The schema is NOT NULL; this stores JSON null.
+	require.NoError(t, legacy.BatchInsertItems(ctx, []data.Item{untouched, nullKey, zero, missing, array, jsonNull}))
+	// Retained rows from an earlier rollback must never override legacy keys,
+	// including an explicit JSON null or numeric zero, or non-object labels.
+	for i, id := range []string{"legacy", "null-key", "zero", "array", "json-null"} {
+		_, err = client.Exec("INSERT INTO "+prefix+"item_view_counts (item_id,view_count,projection_hash) VALUES (?,?,UNHEX(REPEAT('ab',32)))", id, i+7)
+		require.NoError(t, err)
+	}
+	_, before, err := modern.GetItems(ctx, "", 10, nil)
+	require.NoError(t, err)
+	require.Len(t, before, 7)
+	byID := func(items []data.Item) map[string]data.Item {
+		out := make(map[string]data.Item, len(items))
+		for _, item := range items {
+			out[item.ItemId] = item
+		}
+		return out
+	}
+	want := byID(before)
+	require.Equal(t, float64(42), viewCount(t, want["legacy"]))
+	require.Equal(t, float64(0), viewCount(t, want["zero"]))
+	require.Nil(t, want["null-key"].Labels.(map[string]any)["viewCount"])
+	require.NotContains(t, want["missing-count"].Labels.(map[string]any), "viewCount")
+	// Compare physical bytes for every excluded row as well as public readers.
+	untouchedLabels := func() map[string]string {
+		rows, err := client.Query("SELECT item_id,labels FROM " + prefix + "items WHERE item_id<>'converted'")
+		require.NoError(t, err)
+		defer rows.Close()
+		out := map[string]string{}
+		for rows.Next() {
+			var id, labels string
+			require.NoError(t, rows.Scan(&id, &labels))
+			out[id] = labels
+		}
+		require.NoError(t, rows.Err())
+		return out
+	}
+	physicalBefore := untouchedLabels()
+	require.Equal(t, int64(1), copyBackViewCounts(t, client, prefix+"items", prefix+"item_view_counts"))
+	require.Equal(t, physicalBefore, untouchedLabels(), "all non-converted labels are byte-preserved")
+	_, after, err := legacy.GetItems(ctx, "", 10, nil)
+	require.NoError(t, err)
+	require.Equal(t, want, byID(after), "split and old readers agree after guarded copy-back")
+	for _, item := range after {
+		require.Equal(t, sortedFeatures(want[item.ItemId].Labels), sortedFeatures(item.Labels))
+		require.Equal(t, ctr.ConvertEmbeddings(want[item.ItemId].Labels), ctr.ConvertEmbeddings(item.Labels))
+	}
+	var numericType string
+	require.NoError(t, client.QueryRow("SELECT JSON_TYPE(JSON_EXTRACT(labels,'$.viewCount')) FROM "+prefix+"items WHERE item_id='converted'").Scan(&numericType))
+	require.Equal(t, "INTEGER", numericType, "copy-back restores a numeric label, not a string")
+	require.Zero(t, copyBackViewCounts(t, client, prefix+"items", prefix+"item_view_counts"), "a second copy-back is a no-op")
+	converted.Labels.(map[string]any)["viewCount"] = int64(81)
+	converted.Labels.(map[string]any)["embedding"] = vector
+	expectBranch(t, data.ViewCountBranchLegacyConversion, func() {
+		require.NoError(t, modern.BatchInsertItems(data.WithTwitchLiveProjection(ctx), []data.Item{converted}))
+	})
+	current, err := modern.GetItem(ctx, "converted")
+	require.NoError(t, err)
+	require.Equal(t, float64(81), viewCount(t, current))
+}
+
 func TestMySQLTwitchViewCountsUpgradeReadersAndHealing(t *testing.T) {
 	ctx := context.Background()
 	legacy, db, sqlDB, prefix := countFixture(t)
@@ -173,8 +272,7 @@ func TestMySQLTwitchViewCountsUpgradeReadersAndHealing(t *testing.T) {
 	require.Equal(t, float64(8731), viewCount(t, after))
 	// Rollback preparation restores the old physical representation. Re-enabling
 	// must normalize it again rather than trust the old projection fingerprint.
-	_, err = sqlDB.Exec("UPDATE " + prefix + "items i JOIN " + prefix + "item_view_counts c ON i.item_id=c.item_id SET i.labels=JSON_SET(i.labels,'$.viewCount',c.view_count)")
-	require.NoError(t, err)
+	require.Equal(t, int64(1), copyBackViewCounts(t, sqlDB, prefix+"items", prefix+"item_view_counts"))
 	restored, err := legacy.GetItem(ctx, "live")
 	require.NoError(t, err)
 	require.Equal(t, float64(8731), viewCount(t, restored))
