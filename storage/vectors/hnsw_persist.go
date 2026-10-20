@@ -403,6 +403,11 @@ func loadHNSWCollection(name, dir string, opts hnswOptions) (*hnswCollection, er
 	// The recovered state is older than what was written last; mark it dirty so
 	// the next maintenance pass writes a fresh index.bin.
 	collection.savedVersion = 0
+	if opts.snapshotCompression != "zstd" {
+		// The first rotation moves the unreadable current file to .old.
+		// Rotate twice so a successful v1 flush repairs both recovery files.
+		collection.rewriteSnapshots = 2
+	}
 	return collection, nil
 }
 

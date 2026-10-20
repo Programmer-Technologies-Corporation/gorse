@@ -343,6 +343,47 @@ func TestHNSWCompressedStoreCloseAndOptimizeDowngrade(t *testing.T) {
 	}
 }
 
+func TestHNSWCompressedLegacyFallbackCloseRepairsBothFiles(t *testing.T) {
+	for _, damage := range []string{"truncated", "checksum"} {
+		t.Run(damage, func(t *testing.T) {
+			root := t.TempDir()
+			c := compressionFixture(t, "fp16")
+			c.dir = filepath.Join(root, c.name)
+			require.NoError(t, os.Mkdir(c.dir, 0700))
+			require.NoError(t, c.snapshot())
+			c.version++
+			require.NoError(t, c.snapshot())
+			current := filepath.Join(c.dir, hnswSnapshotFile)
+			bad := []byte{1, 2, 3}
+			if damage == "checksum" {
+				var err error
+				bad, err = os.ReadFile(current)
+				require.NoError(t, err)
+				bad[len(bad)-1] ^= 0xff
+			}
+			require.NoError(t, os.WriteFile(current, bad, 0600))
+			db := openHNSW(t, root, "?snapshot_compression=none")
+			require.NoError(t, db.Close())
+			for _, name := range []string{hnswSnapshotFile, hnswPreviousSnapshot} {
+				path := filepath.Join(c.dir, name)
+				version, err := hnswSnapshotFileVersion(path)
+				require.NoError(t, err)
+				require.EqualValues(t, 1, version)
+				loaded, err := loadHNSWSnapshot(path, c.name, c.dir, defaultHNSWOptions())
+				require.NoError(t, err)
+				require.Equal(t, c.get([]string{"id-1", "id-7", "id-9"}), loaded.get([]string{"id-1", "id-7", "id-9"}))
+			}
+			// The legacy-compatible URL omits the new option entirely.
+			reopened := openHNSW(t, root, "")
+			require.NoError(t, reopened.Close())
+			for _, name := range []string{hnswSnapshotFile, hnswPreviousSnapshot} {
+				_, err := loadHNSWSnapshot(filepath.Join(c.dir, name), c.name, c.dir, defaultHNSWOptions())
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
 func TestHNSWCompressedSnapshotFailurePreservesCurrent(t *testing.T) {
 	c := compressionFixture(t, "fp16")
 	c.opts.snapshotCompression = "zstd"
@@ -409,9 +450,11 @@ func TestHNSWCompressedExportRollbackFixture(t *testing.T) {
 	legacy, err := loadHNSWCollection(c.name, c.dir, defaultHNSWOptions())
 	require.NoError(t, err)
 	require.NoError(t, legacy.snapshot())
+	outputDir := filepath.Join(destination, c.name)
+	require.NoError(t, os.Mkdir(outputDir, 0700))
 	for _, name := range []string{hnswSnapshotFile, hnswPreviousSnapshot} {
 		data, err := os.ReadFile(filepath.Join(c.dir, name))
 		require.NoError(t, err)
-		require.NoError(t, os.WriteFile(filepath.Join(destination, name), data, 0600))
+		require.NoError(t, os.WriteFile(filepath.Join(outputDir, name), data, 0600))
 	}
 }

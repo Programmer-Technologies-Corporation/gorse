@@ -36,8 +36,10 @@ the decoder is then reset for reconstruction. No decoded copy is buffered or
 written to disk. Explicit allocation accounting is capped at the smaller of
 1 GiB and four times verified decoded bytes, including allowances for metadata,
 maps, and slice headers.
-These limits are independent of compressed physical file size; they are not a
-guarantee about total process RSS. V1 retains its existing reader limits.
+Sparse posting lists and map buckets reconstructed during loading are not
+individually charged. This is an accounting limit, not a cap on actual decoded
+heap or total process RSS. The limits are independent of compressed physical
+file size. V1 retains its existing reader limits.
 The writer checks decoded size and the reader's allocation charges before
 encoding. A valid collection outside either v2 limit automatically uses the
 original v1 writer even when compression is enabled, preserving checkpoint
@@ -68,11 +70,18 @@ To downgrade without weakening recovery:
    a v2 current snapshot schedules two v1 rotations. Loading a v1 current snapshot
    with a v2 previous snapshot schedules one v1 rotation. The normal maintenance,
    `Optimize`, or `Close` path completes these rotations even without new writes.
+   Recovery from an unreadable current file also schedules two v1 rotations,
+   so the first rotation cannot leave the damaged file as the only fallback.
 3. Verify successful conversion before replacing the binary. Both `index.bin`
    and `index.bin.old` must have magic `0x49485647` and version `1` in their
    first eight bytes. Use the new reader to verify both files, including CRC32.
    A conversion error means rollback is not ready; keep the dual-format binary.
-4. Only then start the old binary. Do not delete either recovery file to force
+4. Remove the `snapshot_compression` option entirely from the vector-store URL
+   before starting the old binary. The deployed `044fa37` parser rejects the
+   option even when its value is `none`. Preserve supported existing parameters;
+   for example, use `hnsw:///var/lib/gorse/master/hnsw?snapshot_interval=1m`, or
+   omit the query entirely when there are no other options.
+5. Only then start the old binary. Do not delete either recovery file to force
    rollback. Tests cover both files independently and torn-current fallback.
 
 Conversion writes two full legacy snapshots once; it is a rollback cost, not
@@ -95,7 +104,9 @@ GORSE_SNAPSHOT_COMPRESSION_STUDY=1 \
 CI additionally exports synthetic downgraded recovery files, checks out the
 exact deployed `044fa37` revision into a separate directory, and runs the small
 `hnsw_legacy_compat_test.go` probe against both files using that revision's
-unchanged reader. It verifies vectors, tombstones, hidden state and query order.
+unchanged parser and reader. It verifies the old parser rejects the new option,
+the URL with that option removed opens the store, and both recovery files retain
+vectors, tombstones, hidden state and query order.
 
 Tests cover exact vectors and query output after reload, empty/dense FP16/dense
 FP32/sparse snapshots, byte-identical default v1 output, timestamp-only refreshes,

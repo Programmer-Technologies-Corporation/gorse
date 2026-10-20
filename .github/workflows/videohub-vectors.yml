@@ -93,6 +93,7 @@ jobs:
       - name: Verify both downgraded files with the exact deployed v1 reader
         env:
           GORSE_SNAPSHOT_ROLLBACK_FIXTURE: ${{ runner.temp }}/snapshot-rollback-fixture
+          GORSE_SNAPSHOT_EXPECT_LEGACY_PARSER: '1'
         run: |
           test "$(git -C .snapshot-baseline rev-parse HEAD)" = 044fa37d6f17eac7ae6fcb8ee74c8c9e24b3e5a5
           cp storage/vectors/hnsw_legacy_compat_test.go .snapshot-baseline/storage/vectors/
