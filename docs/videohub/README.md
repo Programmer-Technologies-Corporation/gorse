@@ -376,7 +376,9 @@ filters on `hidden = false`) forward-scans all rows and allocates about 24 MB at
 the heap in any case, and `Optimize` is a full rewrite plus index build.
 
 Options (URL query): `m`, `m0`, `ef_construction`, `ef_search`, `precision`,
-`snapshot_interval`, `compact_ratio`, `scan_ratio`, `scan_min`.
+`snapshot_interval`, `snapshot_compression`, `compact_ratio`, `scan_ratio`, `scan_min`.
+Snapshot compression defaults to `none`; see [lossless snapshot compression](snapshot-compression.md)
+for the opt-in format, decoder bounds, measurements, and old-binary rollback procedure.
 
 Metrics (master `/metrics`):
 

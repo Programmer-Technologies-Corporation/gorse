@@ -25,6 +25,7 @@ import (
 	"time"
 
 	"github.com/gorse-io/gorse/common/log"
+	"github.com/klauspost/compress/zstd"
 	"github.com/pkg/errors"
 	"go.uber.org/zap"
 )
@@ -39,13 +40,22 @@ import (
 // previous snapshot are lost.
 
 const (
-	hnswSnapshotMagic   = 0x49485647 // "GVHI"
-	hnswSnapshotVersion = 1
+	hnswSnapshotMagic             = 0x49485647 // "GVHI"
+	hnswSnapshotVersion           = 1
+	hnswCompressedSnapshotVersion = 2
+	hnswCompressedHeaderBytes     = 16
+	// Compression is opt-in. Reject large/corrupt envelopes before decoding,
+	// and separately bound explicit decoded allocations and zstd's window.
+	hnswMaxDecodedSnapshotBytes    = 1 << 30
+	hnswMaxSnapshotAllocationBytes = 1 << 30
+	hnswSnapshotWindowBytes        = 1 << 20
 
 	hnswPrecisionUnset byte = 0
 	hnswPrecision32    byte = 1
 	hnswPrecision16    byte = 2
 )
+
+var errHNSWCompressedSizeLimit = errors.New("compressed snapshot decoded size exceeds limit")
 
 // hnswFrozen is a consistent view of a collection taken under its read lock.
 // Append-only data is shared by slice header, data that changes in place is
@@ -123,31 +133,97 @@ func (c *hnswCollection) freeze() *hnswFrozen {
 func (c *hnswCollection) snapshot() error {
 	c.ioMu.Lock()
 	defer c.ioMu.Unlock()
-	c.mu.RLock()
-	if c.dropped || c.version == c.savedVersion {
+	for {
+		c.mu.RLock()
+		if c.dropped || (c.version == c.savedVersion && c.rewriteSnapshots == 0) {
+			c.mu.RUnlock()
+			return nil
+		}
+		frozen := c.freeze()
 		c.mu.RUnlock()
-		return nil
-	}
-	frozen := c.freeze()
-	c.mu.RUnlock()
 
-	start := time.Now()
-	size, err := frozen.writeFile(filepath.Join(c.dir, hnswSnapshotFile))
-	if err != nil {
-		hnswSnapshotFailuresTotal.WithLabelValues(c.name).Inc()
-		return errors.WithStack(err)
+		start := time.Now()
+		size, err := frozen.writeFile(filepath.Join(c.dir, hnswSnapshotFile), c.opts.snapshotCompression == "zstd")
+		if err != nil {
+			hnswSnapshotFailuresTotal.WithLabelValues(c.name).Inc()
+			return errors.WithStack(err)
+		}
+		c.mu.Lock()
+		c.savedVersion = frozen.version
+		if c.rewriteSnapshots > 0 {
+			c.rewriteSnapshots--
+		}
+		rewrite := c.rewriteSnapshots > 0
+		c.mu.Unlock()
+		hnswSnapshotSeconds.WithLabelValues(c.name).Set(time.Since(start).Seconds())
+		hnswSnapshotBytes.WithLabelValues(c.name).Set(float64(size))
+		log.Logger().Debug("saved vector collection",
+			zap.String("collection", c.name), zap.Int64("bytes", size), zap.Duration("used_time", time.Since(start)))
+		if !rewrite {
+			return nil
+		}
 	}
-	c.mu.Lock()
-	c.savedVersion = frozen.version
-	c.mu.Unlock()
-	hnswSnapshotSeconds.WithLabelValues(c.name).Set(time.Since(start).Seconds())
-	hnswSnapshotBytes.WithLabelValues(c.name).Set(float64(size))
-	log.Logger().Debug("saved vector collection",
-		zap.String("collection", c.name), zap.Int64("bytes", size), zap.Duration("used_time", time.Since(start)))
-	return nil
 }
 
-func (f *hnswFrozen) writeFile(path string) (int64, error) {
+func (f *hnswFrozen) writeFile(path string, compressed bool) (int64, error) {
+	return f.writeFileWithLimits(path, compressed, hnswMaxDecodedSnapshotBytes, hnswMaxSnapshotAllocationBytes)
+}
+
+func (f *hnswFrozen) writeFileWithLimits(path string, compressed bool, decodedLimit, allocationLimit uint64) (int64, error) {
+	if !compressed {
+		return f.writeFileEncoded(path, false, decodedLimit)
+	}
+	// Larger valid collections retain the original writer's capacity. Never
+	// install a compressed checkpoint that this reader would reject.
+	decodedBytes, allocationBytes := f.snapshotSizes()
+	compressed = compressed && decodedBytes <= decodedLimit && allocationBytes <= min(allocationLimit, 4*decodedBytes)
+	size, err := f.writeFileEncoded(path, compressed, decodedLimit)
+	if errors.Is(err, errHNSWCompressedSizeLimit) {
+		return f.writeFileEncoded(path, false, decodedLimit)
+	}
+	return size, err
+}
+
+// Sizes mirror the v1 encoding and the compressed reader's allocation charges.
+// Slice lengths already exist in memory, so their sums fit the address space.
+func (f *hnswFrozen) snapshotSizes() (uint64, uint64) {
+	encoded := uint64(64) // fixed fields, category/set counts, CRC32
+	allocated := uint64(len(f.ids))*128 + uint64(len(f.catNames))*64
+	for _, id := range f.ids {
+		encoded += 4 + uint64(len(id))
+		allocated += 2 * uint64(len(id))
+	}
+	for _, name := range f.catNames {
+		encoded += 4 + uint64(len(name))
+		allocated += 2 * uint64(len(name))
+	}
+	for _, set := range f.sets {
+		encoded += 4 + 4*uint64(len(set))
+		allocated += 64 + 8*uint64(len(set))
+	}
+	encoded += uint64(len(f.hidden)) + uint64(len(f.deleted)) + 8*uint64(len(f.timestamps)) + 4*uint64(len(f.catSet))
+	allocated += uint64(len(f.hidden)) + uint64(len(f.deleted)) + 4*uint64(len(f.catSet))
+	if f.dim == 0 {
+		encoded += 8*uint64(len(f.starts)) + 4*uint64(len(f.indices)+len(f.values))
+		allocated += 4 * uint64(len(f.indices)+len(f.values))
+		return encoded, allocated
+	}
+	if f.precision == hnswPrecisionUnset {
+		return encoded, allocated
+	}
+	arrays := 2*uint64(len(f.vec16)) + 4*uint64(len(f.vec32)) + 4*uint64(len(f.norms)) + uint64(len(f.levels)) + 2*uint64(len(f.count0)) + 4*uint64(len(f.links0))
+	encoded += arrays + 4
+	allocated += arrays
+	for _, links := range f.upper {
+		if links != nil {
+			encoded += 4 + 4*uint64(len(links))
+			allocated += 4 * uint64(len(links))
+		}
+	}
+	return encoded, allocated
+}
+
+func (f *hnswFrozen) writeFileEncoded(path string, compressed bool, decodedLimit uint64) (int64, error) {
 	temporary := path + ".tmp"
 	file, err := os.Create(temporary)
 	if err != nil {
@@ -160,8 +236,25 @@ func (f *hnswFrozen) writeFile(path string) (int64, error) {
 			_ = os.Remove(temporary)
 		}
 	}()
+	var output io.Writer = file
+	var encoder *zstd.Encoder
+	if compressed {
+		var header [hnswCompressedHeaderBytes]byte
+		binary.LittleEndian.PutUint32(header[:4], hnswSnapshotMagic)
+		binary.LittleEndian.PutUint32(header[4:8], hnswCompressedSnapshotVersion)
+		if _, err = file.Write(header[:]); err != nil {
+			return 0, err
+		}
+		encoder, err = zstd.NewWriter(file, zstd.WithEncoderConcurrency(1), zstd.WithEncoderLevel(zstd.SpeedFastest), zstd.WithWindowSize(hnswSnapshotWindowBytes))
+		if err != nil {
+			return 0, err
+		}
+		defer encoder.Close()
+		output = encoder
+	}
 	checksum := crc32.NewIEEE()
-	w := &snapshotWriter{w: bufio.NewWriterSize(io.MultiWriter(file, checksum), 1<<20)}
+	counted := &snapshotCountingWriter{Writer: output}
+	w := &snapshotWriter{w: bufio.NewWriterSize(io.MultiWriter(counted, checksum), 1<<20)}
 	f.encode(w)
 	if w.err == nil {
 		w.err = w.w.Flush()
@@ -171,8 +264,21 @@ func (f *hnswFrozen) writeFile(path string) (int64, error) {
 	}
 	var trailer [4]byte
 	binary.LittleEndian.PutUint32(trailer[:], checksum.Sum32())
-	if _, err = file.Write(trailer[:]); err != nil {
+	if _, err = counted.Write(trailer[:]); err != nil {
 		return 0, err
+	}
+	if encoder != nil {
+		if err = encoder.Close(); err != nil {
+			return 0, err
+		}
+		if uint64(counted.bytes) > decodedLimit {
+			return 0, errHNSWCompressedSizeLimit
+		}
+		var length [8]byte
+		binary.LittleEndian.PutUint64(length[:], uint64(counted.bytes))
+		if _, err = file.WriteAt(length[:], 8); err != nil {
+			return 0, err
+		}
 	}
 	if err = file.Sync(); err != nil {
 		return 0, err
@@ -193,6 +299,17 @@ func (f *hnswFrozen) writeFile(path string) (int64, error) {
 	}
 	committed = true
 	return size, nil
+}
+
+type snapshotCountingWriter struct {
+	io.Writer
+	bytes int64
+}
+
+func (w *snapshotCountingWriter) Write(p []byte) (int, error) {
+	n, err := w.Writer.Write(p)
+	w.bytes += int64(n)
+	return n, err
 }
 
 func (f *hnswFrozen) encode(w *snapshotWriter) {
@@ -266,6 +383,11 @@ func (f *hnswFrozen) encode(w *snapshotWriter) {
 func loadHNSWCollection(name, dir string, opts hnswOptions) (*hnswCollection, error) {
 	collection, err := loadHNSWSnapshot(filepath.Join(dir, hnswSnapshotFile), name, dir, opts)
 	if err == nil {
+		if opts.snapshotCompression != "zstd" && collection.rewriteSnapshots == 0 {
+			if version, _ := hnswSnapshotFileVersion(filepath.Join(dir, hnswPreviousSnapshot)); version == hnswCompressedSnapshotVersion {
+				collection.rewriteSnapshots = 1
+			}
+		}
 		return collection, nil
 	}
 	previous := filepath.Join(dir, hnswPreviousSnapshot)
@@ -281,6 +403,11 @@ func loadHNSWCollection(name, dir string, opts hnswOptions) (*hnswCollection, er
 	// The recovered state is older than what was written last; mark it dirty so
 	// the next maintenance pass writes a fresh index.bin.
 	collection.savedVersion = 0
+	if opts.snapshotCompression != "zstd" {
+		// The first rotation moves the unreadable current file to .old.
+		// Rotate twice so a successful v1 flush repairs both recovery files.
+		collection.rewriteSnapshots = 2
+	}
 	return collection, nil
 }
 
@@ -297,25 +424,109 @@ func loadHNSWSnapshot(path, name, dir string, opts hnswOptions) (*hnswCollection
 	if stat.Size() < 4 {
 		return nil, errors.Errorf("snapshot %s is truncated", path)
 	}
+	var header [hnswCompressedHeaderBytes]byte
+	_, headerErr := file.ReadAt(header[:8], 0)
+	if headerErr == nil && binary.LittleEndian.Uint32(header[:4]) == hnswSnapshotMagic && binary.LittleEndian.Uint32(header[4:8]) == hnswCompressedSnapshotVersion {
+		if _, err = file.ReadAt(header[:], 0); err != nil {
+			return nil, errors.Wrap(err, "compressed snapshot header")
+		}
+		decodedSize := binary.LittleEndian.Uint64(header[8:])
+		if decodedSize < 12 || decodedSize > hnswMaxDecodedSnapshotBytes {
+			return nil, errors.New("compressed snapshot decoded size is outside limit")
+		}
+		decoder, err := zstd.NewReader(io.NewSectionReader(file, hnswCompressedHeaderBytes, stat.Size()-hnswCompressedHeaderBytes),
+			zstd.WithDecoderConcurrency(1), zstd.WithDecoderLowmem(true), zstd.WithDecoderMaxMemory(8*hnswSnapshotWindowBytes), zstd.WithDecoderMaxWindow(hnswSnapshotWindowBytes))
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		defer decoder.Close()
+		// The envelope length is untrusted. Establish actual decoded bytes and
+		// integrity before any collection allocation; a forged large length
+		// cannot turn a tiny corrupt frame into a host-sized allocation.
+		if err = validateCompressedHNSWStream(decoder, decodedSize); err != nil {
+			return nil, err
+		}
+		if err = decoder.Reset(io.NewSectionReader(file, hnswCompressedHeaderBytes, stat.Size()-hnswCompressedHeaderBytes)); err != nil {
+			return nil, err
+		}
+		limited := &io.LimitedReader{R: decoder, N: int64(decodedSize)}
+		allocationLimit := min(uint64(hnswMaxSnapshotAllocationBytes), 4*decodedSize)
+		collection, err := readHNSWSnapshot(limited, decodedSize, name, dir, opts, allocationLimit)
+		if err != nil {
+			return nil, err
+		}
+		var extra [1]byte
+		if n, endErr := decoder.Read(extra[:]); n != 0 || endErr != io.EOF || limited.N != 0 {
+			return nil, errors.New("compressed snapshot decoded length or frame integrity differs")
+		}
+		if opts.snapshotCompression != "zstd" {
+			collection.rewriteSnapshots = 2
+		}
+		return collection, nil
+	}
+	return readHNSWSnapshot(file, uint64(stat.Size()), name, dir, opts, 0)
+}
+
+func validateCompressedHNSWStream(decoder io.Reader, size uint64) error {
+	checksum := crc32.NewIEEE()
+	n, err := io.Copy(checksum, io.LimitReader(decoder, int64(size)-4))
+	if err != nil {
+		return errors.Wrap(err, "validate compressed snapshot")
+	}
+	if n != int64(size)-4 {
+		return errors.New("compressed snapshot decoded length differs")
+	}
+	var trailer [4]byte
+	if _, err = io.ReadFull(decoder, trailer[:]); err != nil {
+		return errors.Wrap(err, "compressed snapshot checksum trailer")
+	}
+	if binary.LittleEndian.Uint32(trailer[:]) != checksum.Sum32() {
+		return errors.New("compressed snapshot failed its checksum")
+	}
+	var extra [1]byte
+	if n, endErr := decoder.Read(extra[:]); n != 0 || endErr != io.EOF {
+		return errors.New("compressed snapshot decoded length or frame integrity differs")
+	}
+	return nil
+}
+
+func hnswSnapshotFileVersion(path string) (uint32, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+	var header [8]byte
+	if _, err = io.ReadFull(file, header[:]); err != nil {
+		return 0, err
+	}
+	if binary.LittleEndian.Uint32(header[:4]) != hnswSnapshotMagic {
+		return 0, errors.New("invalid snapshot magic")
+	}
+	return binary.LittleEndian.Uint32(header[4:]), nil
+}
+
+func readHNSWSnapshot(input io.Reader, size uint64, name, dir string, opts hnswOptions, allocationLimit uint64) (*hnswCollection, error) {
 	checksum := crc32.NewIEEE()
 	r := &snapshotReader{
-		r:     bufio.NewReaderSize(io.TeeReader(io.LimitReader(file, stat.Size()-4), checksum), 1<<20),
-		limit: uint64(stat.Size()),
+		r:               bufio.NewReaderSize(io.TeeReader(io.LimitReader(input, int64(size)-4), checksum), 1<<20),
+		limit:           size,
+		allocationLimit: allocationLimit,
 	}
 	collection := decodeHNSWCollection(r, name, dir, opts)
 	if r.err != nil {
-		return nil, errors.Wrapf(r.err, "read snapshot %s", path)
+		return nil, errors.Wrap(r.err, "read snapshot")
 	}
 	// Drain what a newer writer may have appended so the checksum covers it.
-	if _, err = io.Copy(io.Discard, r.r); err != nil {
+	if _, err := io.Copy(io.Discard, r.r); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	var trailer [4]byte
-	if _, err = file.ReadAt(trailer[:], stat.Size()-4); err != nil {
+	if _, err := io.ReadFull(input, trailer[:]); err != nil {
 		return nil, errors.WithStack(err)
 	}
 	if binary.LittleEndian.Uint32(trailer[:]) != checksum.Sum32() {
-		return nil, errors.Errorf("snapshot %s failed its checksum", path)
+		return nil, errors.New("snapshot failed its checksum")
 	}
 	return collection, nil
 }
@@ -340,16 +551,28 @@ func decodeHNSWCollection(r *snapshotReader, name, dir string, opts hnswOptions)
 	if r.err != nil {
 		return nil
 	}
+	// Maps, slice headers and per-slot metadata also consume heap beyond the
+	// encoded arrays. Charge a conservative allowance before their first make.
+	if !r.reserve(n, 128) {
+		return nil
+	}
 
 	collection := newHNSWCollection(name, dir, dim, distance, opts)
 	meta := collection.meta
-	meta.catNames = make([]string, r.count(4))
+	categoryCount := r.count(4)
+	if !r.reserve(categoryCount, 64) {
+		return nil
+	}
+	meta.catNames = make([]string, categoryCount)
 	for i := range meta.catNames {
 		meta.catNames[i] = r.str()
 		meta.catIDs[meta.catNames[i]] = uint32(i)
 	}
 	for i, sets := 0, r.count(4); i < sets && r.err == nil; i++ {
 		set := r.u32s(r.count(4))
+		if !r.reserve(1, 64) || !r.reserve(len(set), 4) {
+			return nil
+		}
 		for _, id := range set {
 			if int(id) >= len(meta.catNames) {
 				r.fail("category set refers to an unknown category")
@@ -591,11 +814,13 @@ func (w *snapshotWriter) f32s(values []float32) {
 }
 
 type snapshotReader struct {
-	r       *bufio.Reader
-	limit   uint64 // file size: no count in a valid file can exceed it
-	scratch [8]byte
-	chunk   [1 << 15]byte
-	err     error
+	r               *bufio.Reader
+	limit           uint64 // file size: no count in a valid file can exceed it
+	allocationLimit uint64 // zero preserves the original v1 reader's limits
+	allocated       uint64
+	scratch         [8]byte
+	chunk           [1 << 15]byte
+	err             error
 }
 
 func (r *snapshotReader) fail(message string) {
@@ -646,15 +871,34 @@ func (r *snapshotReader) count(width uint64) int {
 }
 
 func (r *snapshotReader) sized(n, width int) bool {
+	return r.checkSize(n, width) && r.reserve(n, width)
+}
+
+func (r *snapshotReader) checkSize(n, width int) bool {
 	if r.err == nil && (n < 0 || uint64(n)*uint64(width) > r.limit) {
 		r.fail("array is larger than the file")
 	}
 	return r.err == nil
 }
 
+func (r *snapshotReader) reserve(n, width int) bool {
+	if r.err != nil {
+		return false
+	}
+	if r.allocationLimit == 0 {
+		return true
+	}
+	if n < 0 || width <= 0 || uint64(n) > (r.allocationLimit-r.allocated)/uint64(width) {
+		r.fail("snapshot decoded allocation exceeds limit")
+		return false
+	}
+	r.allocated += uint64(n) * uint64(width)
+	return true
+}
+
 func (r *snapshotReader) str() string {
 	n := r.count(4)
-	if !r.sized(n, 1) {
+	if !r.sized(n, 1) || !r.reserve(n, 1) {
 		return ""
 	}
 	buffer := make([]byte, n)
@@ -682,7 +926,9 @@ func (r *snapshotReader) bools(n int) []bool {
 
 // words reads n little-endian words of the given width in chunks.
 func (r *snapshotReader) words(n, width int, store func(i int, word []byte)) bool {
-	if !r.sized(n, width) {
+	// The typed caller already charged the allocated array. This repeated
+	// bounds check protects slab decoding without charging that memory twice.
+	if !r.checkSize(n, width) {
 		return false
 	}
 	for i := 0; i < n && r.err == nil; {

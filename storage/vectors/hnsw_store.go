@@ -76,22 +76,24 @@ func init() {
 }
 
 type hnswOptions struct {
-	params           hnswParams
-	precision        string
-	snapshotInterval time.Duration
-	compactRatio     float64 // rebuild a graph when tombstones exceed this share of its slots
-	scanRatio        float64 // filters matching less than this share are answered by an exact scan
-	scanMin          int     // ... as are filters matching fewer vectors than this
+	params              hnswParams
+	precision           string
+	snapshotInterval    time.Duration
+	snapshotCompression string
+	compactRatio        float64 // rebuild a graph when tombstones exceed this share of its slots
+	scanRatio           float64 // filters matching less than this share are answered by an exact scan
+	scanMin             int     // ... as are filters matching fewer vectors than this
 }
 
 func defaultHNSWOptions() hnswOptions {
 	return hnswOptions{
-		params:           hnswParams{M: 32, M0: 64, EFConstruction: 200, EFSearch: 100},
-		precision:        hnswPrecisionAuto,
-		snapshotInterval: time.Minute,
-		compactRatio:     0.2,
-		scanRatio:        0.05,
-		scanMin:          4096,
+		params:              hnswParams{M: 32, M0: 64, EFConstruction: 200, EFSearch: 100},
+		precision:           hnswPrecisionAuto,
+		snapshotInterval:    time.Minute,
+		snapshotCompression: "none",
+		compactRatio:        0.2,
+		scanRatio:           0.05,
+		scanMin:             4096,
 	}
 }
 
@@ -158,9 +160,15 @@ func parseHNSWOptions(rawQuery string) (hnswOptions, error) {
 			return opts, errors.Errorf("hnsw option snapshot_interval must be a positive duration")
 		}
 	}
+	if values.Has("snapshot_compression") {
+		opts.snapshotCompression = values.Get("snapshot_compression")
+		if opts.snapshotCompression != "none" && opts.snapshotCompression != "zstd" {
+			return opts, errors.New("hnsw option snapshot_compression must be none or zstd")
+		}
+	}
 	for key := range values {
 		switch key {
-		case "m", "m0", "ef_construction", "ef_search", "scan_min", "compact_ratio", "scan_ratio", "precision", "snapshot_interval":
+		case "m", "m0", "ef_construction", "ef_search", "scan_min", "compact_ratio", "scan_ratio", "precision", "snapshot_interval", "snapshot_compression":
 		default:
 			return opts, errors.Errorf("unknown hnsw option %s", key)
 		}
@@ -699,8 +707,11 @@ type hnswCollection struct {
 
 	version      uint64 // bumped by every change worth persisting
 	savedVersion uint64
-	lastWrite    time.Time
-	dropped      bool
+	// Conversion back to v1 rotates two verified legacy snapshots even when
+	// no vectors changed, so an old binary can use either recovery file.
+	rewriteSnapshots int
+	lastWrite        time.Time
+	dropped          bool
 
 	// ioMu serializes snapshots, compaction and removal of the directory.
 	ioMu sync.Mutex

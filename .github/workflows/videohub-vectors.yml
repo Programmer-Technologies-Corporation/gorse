@@ -71,6 +71,34 @@ jobs:
         env:
           CGO_ENABLED: '0'
         run: go build ./cmd/gorse-master ./cmd/gorse-server ./cmd/gorse-worker
+      - name: Measure lossless snapshot bytes, CPU, allocations and restart
+        env:
+          GORSE_SNAPSHOT_COMPRESSION_STUDY: '1'
+          GORSE_SNAPSHOT_COMPRESSION_OUTPUT: ${{ runner.temp }}/snapshot-compression-study.json
+          GORSE_SNAPSHOT_SOURCE_COMMIT: ${{ github.event.pull_request.head.sha || github.sha }}
+        run: go test ./storage/vectors -run '^TestHNSWSnapshotCompressionStudy$' -count=1 -timeout=2m -v
+      - uses: actions/upload-artifact@v4
+        with:
+          name: snapshot-compression-study
+          path: ${{ runner.temp }}/snapshot-compression-study.json
+          if-no-files-found: error
+      - name: Export synthetic downgraded recovery files
+        env:
+          GORSE_SNAPSHOT_ROLLBACK_FIXTURE: ${{ runner.temp }}/snapshot-rollback-fixture
+        run: go test ./storage/vectors -run '^TestHNSWCompressedExportRollbackFixture$' -count=1 -timeout=1m
+      - uses: actions/checkout@v4
+        with:
+          ref: 044fa37d6f17eac7ae6fcb8ee74c8c9e24b3e5a5
+          path: .snapshot-baseline
+      - name: Verify both downgraded files with the exact deployed v1 reader
+        env:
+          GORSE_SNAPSHOT_ROLLBACK_FIXTURE: ${{ runner.temp }}/snapshot-rollback-fixture
+          GORSE_SNAPSHOT_EXPECT_LEGACY_PARSER: '1'
+        run: |
+          test "$(git -C .snapshot-baseline rev-parse HEAD)" = 044fa37d6f17eac7ae6fcb8ee74c8c9e24b3e5a5
+          cp storage/vectors/hnsw_legacy_compat_test.go .snapshot-baseline/storage/vectors/
+          cd .snapshot-baseline
+          go test ./storage/vectors -run '^TestHNSWLegacyRollbackFixture$' -count=1 -timeout=1m
 
   twitch_view_counts:
     runs-on: ubuntu-latest
