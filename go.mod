@@ -217,7 +217,7 @@ require (
 	github.com/josharian/intern v1.0.0 // indirect
 	github.com/json-iterator/go v1.1.13-0.20220915233716-71ac16282d12 // indirect
 	github.com/klauspost/asmfmt v1.3.2 // indirect
-	github.com/klauspost/compress v1.18.6 // indirect
+	github.com/klauspost/compress v1.18.6
 	github.com/klauspost/crc32 v1.3.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/kr/text v0.2.0 // indirect
@@ -265,7 +265,7 @@ require (
 	github.com/rs/xid v1.6.0 // indirect
 	github.com/sagikazarmark/locafero v0.12.0 // indirect
 	github.com/segmentio/asm v1.2.1 // indirect
-	github.com/shirou/gopsutil/v3 v3.23.12 // indirect
+	github.com/shirou/gopsutil/v3 v3.23.12
 	github.com/shoenig/go-m1cpu v0.1.6 // indirect
 	github.com/shopspring/decimal v1.4.0 // indirect
 	github.com/sirupsen/logrus v1.9.4 // indirect
