@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/gorse-io/gorse/storage"
 	"github.com/pkg/errors"
 	"gorm.io/gorm"
@@ -147,6 +149,41 @@ func sameJSONProjection(left, right string) bool {
 	return leftOK && rightOK && canonicalLeft == canonicalRight
 }
 
+const ordinaryItemDeadlockRetries = 8
+
+func isMySQLDeadlock(err error) bool {
+	var mysqlError *mysqldriver.MySQLError
+	return errors.As(err, &mysqlError) && mysqlError.Number == 1213
+}
+
+func retryMySQLDeadlocksWithBackoff(ctx context.Context, operation func() error, backoff func(context.Context, int) error) error {
+	for attempt := 0; ; attempt++ {
+		err := operation()
+		if err == nil || !isMySQLDeadlock(err) || attempt == ordinaryItemDeadlockRetries {
+			return err
+		}
+		if err = backoff(ctx, attempt); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+}
+
+func retryMySQLDeadlocks(ctx context.Context, operation func() error) error {
+	return retryMySQLDeadlocksWithBackoff(ctx, operation, func(ctx context.Context, attempt int) error {
+		// Only the deadlock victim retries; a small per-attempt delay and
+		// clock jitter keep several victims from immediately colliding again
+		// under SERIALIZABLE while keeping the retry window bounded.
+		delay := time.Duration(attempt+1)*20*time.Millisecond +
+			time.Duration(time.Now().UnixNano()%int64(20*time.Millisecond))
+		select {
+		case <-time.After(delay):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+}
+
 func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Item) error {
 	// Preserve first-duplicate-wins semantics and lock in a consistent order.
 	unique := make(map[string]Item, len(items))
@@ -179,46 +216,53 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 			rows[id] = row
 		}
 		decisions.evaluate(ViewCountBranchUnsplittable, len(ids))
-		projectionDecisions := itemProjectionDecisions{}
-		err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			var existing []SQLItem
-			if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
-				Where("item_id IN ?", ids).Order("item_id").Find(&existing).Error; err != nil {
-				return err
-			}
-			byID := make(map[string]SQLItem, len(existing))
-			for _, row := range existing {
-				byID[row.ItemId] = row
-			}
-			changed := make([]SQLItem, 0, len(rows))
-			for _, id := range ids {
-				current, exists := byID[id]
-				switch {
-				case !exists:
-					projectionDecisions.evaluate(ItemProjectionBranchCreated)
-					changed = append(changed, rows[id])
-				case sameSQLItemProjection(current, rows[id]):
-					projectionDecisions.evaluate(ItemProjectionBranchUnchanged)
-				default:
-					projectionDecisions.evaluate(ItemProjectionBranchChanged)
-					changed = append(changed, rows[id])
-				}
-			}
-			if len(changed) > 0 {
-				if err := tx.Clauses(clause.OnConflict{
-					Columns:   []clause.Column{{Name: "item_id"}},
-					DoUpdates: clause.AssignmentColumns([]string{"is_hidden", "categories", "time_stamp", "labels", "comment"}),
-				}).Create(changed).Error; err != nil {
+		var committedProjectionDecisions itemProjectionDecisions
+		err := retryMySQLDeadlocks(ctx, func() error {
+			projectionDecisions := itemProjectionDecisions{}
+			err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				var existing []SQLItem
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("item_id IN ?", ids).Order("item_id").Find(&existing).Error; err != nil {
 					return err
 				}
+				byID := make(map[string]SQLItem, len(existing))
+				for _, row := range existing {
+					byID[row.ItemId] = row
+				}
+				changed := make([]SQLItem, 0, len(rows))
+				for _, id := range ids {
+					current, exists := byID[id]
+					switch {
+					case !exists:
+						projectionDecisions.evaluate(ItemProjectionBranchCreated)
+						changed = append(changed, rows[id])
+					case sameSQLItemProjection(current, rows[id]):
+						projectionDecisions.evaluate(ItemProjectionBranchUnchanged)
+					default:
+						projectionDecisions.evaluate(ItemProjectionBranchChanged)
+						changed = append(changed, rows[id])
+					}
+				}
+				if len(changed) > 0 {
+					if err := tx.Clauses(clause.OnConflict{
+						Columns:   []clause.Column{{Name: "item_id"}},
+						DoUpdates: clause.AssignmentColumns([]string{"is_hidden", "categories", "time_stamp", "labels", "comment"}),
+					}).Create(changed).Error; err != nil {
+						return err
+					}
+				}
+				return tx.Table(d.itemViewCountsTable()).Where("item_id IN ?", ids).Delete(&sqlItemViewCount{}).Error
+			})
+			if err == nil {
+				committedProjectionDecisions = projectionDecisions
 			}
-			return tx.Table(d.itemViewCountsTable()).Where("item_id IN ?", ids).Delete(&sqlItemViewCount{}).Error
+			return err
 		})
 		if err != nil {
 			return err
 		}
 		decisions.committed()
-		projectionDecisions.committed()
+		committedProjectionDecisions.committed()
 		return nil
 	}
 	err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {

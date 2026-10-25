@@ -1,13 +1,85 @@
 package data
 
 import (
+	"context"
 	"encoding/json"
+	"fmt"
 	"testing"
 	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/gorse-io/gorse/storage"
 	"github.com/stretchr/testify/require"
 )
+
+func TestIsMySQLDeadlock(t *testing.T) {
+	deadlock := &mysqldriver.MySQLError{Number: 1213, Message: "synthetic deadlock"}
+	require.True(t, isMySQLDeadlock(deadlock))
+	require.True(t, isMySQLDeadlock(fmt.Errorf("wrapped: %w", deadlock)))
+	require.False(t, isMySQLDeadlock(&mysqldriver.MySQLError{Number: 1205, Message: "lock wait timeout"}))
+	require.False(t, isMySQLDeadlock(fmt.Errorf("other")))
+}
+
+func TestRetryMySQLDeadlocksWithBackoff(t *testing.T) {
+	deadlock := &mysqldriver.MySQLError{Number: 1213, Message: "synthetic deadlock"}
+	nonDeadlock := &mysqldriver.MySQLError{Number: 1205, Message: "lock wait timeout"}
+
+	t.Run("success after retry", func(t *testing.T) {
+		calls, waits := 0, 0
+		err := retryMySQLDeadlocksWithBackoff(context.Background(), func() error {
+			calls++
+			if calls == 1 {
+				return fmt.Errorf("wrapped: %w", deadlock)
+			}
+			return nil
+		}, func(context.Context, int) error {
+			waits++
+			return nil
+		})
+		require.NoError(t, err)
+		require.Equal(t, 2, calls)
+		require.Equal(t, 1, waits)
+	})
+
+	t.Run("bounded", func(t *testing.T) {
+		calls, waits := 0, 0
+		err := retryMySQLDeadlocksWithBackoff(context.Background(), func() error {
+			calls++
+			return deadlock
+		}, func(context.Context, int) error {
+			waits++
+			return nil
+		})
+		require.ErrorIs(t, err, deadlock)
+		require.Equal(t, ordinaryItemDeadlockRetries+1, calls)
+		require.Equal(t, ordinaryItemDeadlockRetries, waits)
+	})
+
+	t.Run("non deadlock is not retried", func(t *testing.T) {
+		calls := 0
+		err := retryMySQLDeadlocksWithBackoff(context.Background(), func() error {
+			calls++
+			return nonDeadlock
+		}, func(context.Context, int) error {
+			t.Fatal("unexpected backoff")
+			return nil
+		})
+		require.ErrorIs(t, err, nonDeadlock)
+		require.Equal(t, 1, calls)
+	})
+
+	t.Run("backoff cancellation stops retry", func(t *testing.T) {
+		calls := 0
+		err := retryMySQLDeadlocksWithBackoff(context.Background(), func() error {
+			calls++
+			return deadlock
+		}, func(context.Context, int) error {
+			return context.Canceled
+		})
+		require.ErrorIs(t, err, context.Canceled)
+		require.Equal(t, 1, calls)
+	})
+}
 
 func TestSameSQLItemProjectionUsesCanonicalContent(t *testing.T) {
 	instant := time.Date(2026, 10, 25, 20, 0, 0, 0, time.UTC)

@@ -181,6 +181,56 @@ func TestMySQLIdenticalItemProjectionAndLabelPatchArePersistentNoOps(t *testing.
 	require.Equal(t, []any{0.75, 0.875}, stored.Labels.(map[string]any)["embedding"])
 }
 
+func TestMySQLTwitchViewCountsRetryConcurrentOrdinaryInsertDeadlocks(t *testing.T) {
+	uri := os.Getenv("TWITCH_COUNT_MYSQL_URI")
+	if uri == "" {
+		t.Skip("TWITCH_COUNT_MYSQL_URI is not set")
+	}
+	ctx := context.Background()
+	for _, isolation := range []string{"REPEATABLE-READ", "SERIALIZABLE"} {
+		t.Run(isolation, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+			t.Cleanup(cancel)
+			prefix := fmt.Sprintf("vc_deadlock_%d_", time.Now().UnixNano())
+			db, err := data.Open(uri, prefix, storage.WithIsolationLevel(isolation), storage.WithSeparateTwitchViewCounts(true))
+			require.NoError(t, err)
+			require.NoError(t, db.Init())
+			t.Cleanup(func() {
+				require.NoError(t, db.Purge())
+				require.NoError(t, db.Close())
+			})
+
+			const writers, itemsPerWriter = 4, 50
+			for round := 0; round < 5; round++ {
+				start := make(chan struct{})
+				errs := make(chan error, writers)
+				ids := make([]string, 0, writers*itemsPerWriter)
+				for writer := 0; writer < writers; writer++ {
+					batch := make([]data.Item, 0, itemsPerWriter)
+					for item := 0; item < itemsPerWriter; item++ {
+						id := fmt.Sprintf("gap-%02d-%04d", round, item*writers+writer)
+						ids = append(ids, id)
+						batch = append(batch, data.Item{ItemId: id, Categories: []string{"video"},
+							Timestamp: time.Date(2026, 10, 25, 20, 0, 0, 0, time.UTC),
+							Labels:    map[string]any{"platform": "youtube", "embedding": []float64{0.25, 0.5}}})
+					}
+					go func(items []data.Item) {
+						<-start
+						errs <- db.BatchInsertItems(ctx, items)
+					}(batch)
+				}
+				close(start)
+				for writer := 0; writer < writers; writer++ {
+					require.NoError(t, <-errs)
+				}
+				stored, err := db.BatchGetItems(ctx, ids, data.GetOptions{})
+				require.NoError(t, err)
+				require.Len(t, stored, writers*itemsPerWriter)
+			}
+		})
+	}
+}
+
 func sortedFeatures(labels any) []ctr.Label {
 	features := ctr.ConvertLabels(labels)
 	sort.Slice(features, func(i, j int) bool { return features[i].Name < features[j].Name })
