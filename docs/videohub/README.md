@@ -19,15 +19,32 @@ Upstream commits are cherry-picked instead, with `-x` so each one names the
 upstream commit it came from, on a topic branch that is merged into `videohub`
 with **Rebase and merge** (a squash would fold upstream's commits into one).
 
-Last upstream commit picked: `bc8ca79` (test: stabilize neural network training, #1386).
+Last upstream commit reviewed: `24e22a8` (build: keep Go build caches in Docker
+layers, #1413). The following compatible changes after the previous `bc8ca79`
+checkpoint are included, with their original commits recorded by `cherry-pick
+-x`: `fe13232` (batch AFM materialization), `dc18f93` (pipelined Redis score
+scans), `37ee00e` (direct feedback-item lookup), `882f428` (compact item
+embeddings during dataset loading), `a9a3c1c` (dashboard secret redaction), and
+`c2b2278` (thread-safe feedback counts).
+
+The remaining commits through that review checkpoint are intentionally not an
+implicit upgrade backlog. In particular, the xvec HNSW/index-preparation chain
+overlaps this fork's production `hnsw://` store and existing optimize/dedup
+hooks; the decision/external-ranker features are not used by VideoHub's local FM
+ranker; item/user `UpdateAt`, ClickHouse removal, the CLI split and later build
+pipeline changes alter storage, API or release contracts without a current
+VideoHub benefit. Re-evaluate skipped commits individually against the active
+configuration rather than cherry-picking a contiguous range.
 
 ```bash
 git fetch upstream
 git checkout master && git merge --ff-only upstream/master && git push origin master
 git checkout -b sync-upstream videohub
-git cherry-pick -x <last upstream commit picked>..upstream/master
+git log --reverse --oneline <last upstream commit reviewed>..upstream/master
+# Review dependencies and VideoHub contracts, then cherry-pick selected commits.
+git cherry-pick -x <compatible upstream commit>...
 go build ./... && go test ./config/ ./logics/ ./server/ ./worker/ ./master/ ./model/ctr/ ./storage/... ./common/floats/
-# update "Last upstream commit picked" above, push, open a PR into videohub
+# update "Last upstream commit reviewed" and the selected/deferred rationale above
 ```
 
 Files that are entirely ours (no merge conflicts expected):

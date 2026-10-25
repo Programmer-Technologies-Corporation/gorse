@@ -104,6 +104,30 @@ func TestConvertEmbeddings(t *testing.T) {
 	}
 }
 
+func TestConvertEmbeddingLabels(t *testing.T) {
+	labels := map[string]any{
+		"profile": map[string]any{
+			"embedding": []float32{1, 2, 3},
+			"tag":       "shared",
+		},
+		"already_compact": floats.FromFloat32([]float32{4, 5}),
+	}
+
+	converted := ConvertEmbeddingLabels(labels)
+	convertedLabels, ok := converted.(map[string]any)
+	assert.True(t, ok)
+	profile, ok := convertedLabels["profile"].(map[string]any)
+	assert.True(t, ok)
+	assert.Equal(t, "shared", profile["tag"])
+	assert.Equal(t, floats.FromFloat32([]float32{1, 2, 3}), profile["embedding"])
+	assert.Equal(t, floats.FromFloat32([]float32{4, 5}), convertedLabels["already_compact"])
+
+	assert.ElementsMatch(t, []Embedding{
+		{Name: "profile.embedding", Value: floats.FromFloat32([]float32{1, 2, 3})},
+		{Name: "already_compact", Value: floats.FromFloat32([]float32{4, 5})},
+	}, ConvertEmbeddings(convertedLabels))
+}
+
 func TestLoadDataFromBuiltIn(t *testing.T) {
 	train, test, err := LoadDataFromBuiltIn("frappe")
 	assert.NoError(t, err)
