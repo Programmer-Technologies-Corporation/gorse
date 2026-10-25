@@ -61,26 +61,31 @@ func TestRedacted(t *testing.T) {
 	}
 	masked, err := conf.Redacted()
 	assert.NoError(t, err)
-	assert.Equal(t, "postgres://localhost/gorse?password=dat******word&sslmode=require&user=dat******user", masked.Database.DataStore)
-	assert.Equal(t, "redis://******:pas******word@localhost:6379?protocol=3", masked.Database.CacheStore)
-	assert.Equal(t, "qdrant://localhost:6334?api_key=vec******-key&timeout=5", masked.Database.VectorStore)
+	assert.Equal(t, "postgres://localhost/gorse?password=******&sslmode=require&user=******", masked.Database.DataStore)
+	assert.Equal(t, "redis://******:******@localhost:6379?protocol=3", masked.Database.CacheStore)
+	assert.Equal(t, "qdrant://localhost:6334?api_key=******&timeout=5", masked.Database.VectorStore)
 	assert.Equal(t, "******", masked.Master.DashboardPassword)
 	assert.Equal(t, "******", masked.Master.AdminAPIKey)
-	assert.Equal(t, "abc******efgh", masked.Server.APIKey)
-	assert.Equal(t, "abc******fghi", masked.OIDC.ClientSecret)
+	assert.Equal(t, "******", masked.Server.APIKey)
+	assert.Equal(t, "******", masked.OIDC.ClientSecret)
 	assert.Equal(t, "******", masked.OpenAI.AuthToken)
-	assert.Equal(t, "abc******hijk", masked.Recommend.Ranker.RerankerAPI.AuthToken)
+	assert.Equal(t, "******", masked.Recommend.Ranker.RerankerAPI.AuthToken)
 	assert.Equal(t, "******", masked.Blob.S3.AccessKeyID)
-	assert.Equal(t, "abc******ijkl", masked.Blob.S3.SecretAccessKey)
-	assert.Equal(t, "abc******jklm", masked.Blob.Azure.AccountKey)
-	assert.Equal(t, "abc******klmn", masked.Blob.Azure.ConnectionString)
+	assert.Equal(t, "******", masked.Blob.S3.SecretAccessKey)
+	assert.Equal(t, "******", masked.Blob.Azure.AccountKey)
+	assert.Equal(t, "******", masked.Blob.Azure.ConnectionString)
+
+	conf.Database.VectorStore = "hnsw:///var/lib/gorse/master/hnsw"
+	masked, err = conf.Redacted()
+	assert.NoError(t, err)
+	assert.Equal(t, conf.Database.VectorStore, masked.Database.VectorStore)
 }
 
 func TestRestoreRedactedSecrets(t *testing.T) {
 	for _, test := range []struct {
 		name, original, posted, expected string
 	}{
-		{"masked", "abcdefghijk", "abc******hijk", "abcdefghijk"},
+		{"masked", "abcdefghijk", "******", "abcdefghijk"},
 		{"short masked", "pass", "******", "pass"},
 		{"changed", "abcdefghijk", "replacement-token", "replacement-token"},
 		{"cleared", "abcdefghijk", "", ""},

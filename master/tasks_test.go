@@ -55,6 +55,23 @@ type failOnceVectorDatabase struct {
 	failed bool
 }
 
+type deleteCountingCache struct {
+	cache.Database
+	calls map[string]int
+}
+
+func (c *deleteCountingCache) DeleteScores(ctx context.Context, collections []string, condition cache.ScoreCondition) error {
+	key := ""
+	if len(collections) > 0 {
+		key = collections[0]
+	}
+	if condition.Subset != nil {
+		key += "/" + *condition.Subset
+	}
+	c.calls[key]++
+	return c.Database.DeleteScores(ctx, collections, condition)
+}
+
 func (d *failOnceVectorDatabase) DeleteCollection(ctx context.Context, name string) error {
 	if name == d.name && !d.failed {
 		d.failed = true
@@ -697,8 +714,12 @@ func (s *MasterTestSuite) TestGarbageCollection() {
 	// load dataset and run garbage collection
 	datasets, err := s.loadDataset(ctx)
 	s.NoError(err)
+	countingCache := &deleteCountingCache{Database: s.CacheClient, calls: make(map[string]int)}
+	s.CacheClient = countingCache
 	err = s.collectGarbage(ctx, datasets.rankingDataset)
 	s.NoError(err)
+	s.Equal(1, countingCache.calls[cache.NonPersonalized+"/unknown"])
+	s.Equal(1, countingCache.calls[cache.CollaborativeFiltering+"/3"])
 
 	// check non-personalized cache
 	np, err := s.CacheClient.SearchScores(ctx, cache.NonPersonalized, "custom", nil, 0, 100)

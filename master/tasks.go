@@ -429,7 +429,14 @@ func (m *Master) LoadDataFromDatabase(
 		snapshot.ItemBytes += deepSize(batchItems)
 		for _, item := range batchItems {
 			labels := ctr.ConvertLabels(item.Labels)
-			item.Labels = ctr.ConvertEmbeddingLabels(item.Labels)
+			// Non-personalized expressions evaluate item.Labels directly. Keep their
+			// original JSON-compatible numeric arrays so FP16 storage bits cannot be
+			// mistaken for expression values. VideoHub has no such recommenders in
+			// production, so its retained dataset still gets the compact form.
+			if len(nonPersonalizedRecommenders) == 0 {
+				item.Labels = ctr.ConvertEmbeddingLabels(item.Labels)
+			}
+			embeddings := ctr.ConvertEmbeddings(item.Labels)
 			dataSet.AddItem(item)
 			itemIndex := dataSet.GetItemDict().Id(item.ItemId)
 			if len(itemLabels) == int(itemIndex) {
@@ -464,7 +471,6 @@ func (m *Master) LoadDataFromDatabase(
 				}
 			}
 			// load embeddings
-			embeddings := ctr.ConvertEmbeddings(item.Labels)
 			itemEmbeddings[itemIndex] = make([][]uint16, 0, len(embeddings))
 			for _, embedding := range embeddings {
 				itemEmbeddingIndexer.Add(embedding.Name)
@@ -1297,6 +1303,8 @@ func (m *Master) collectGarbage(parent context.Context, dataSet *dataset.Dataset
 	defer span.End()
 	documentCounts := make(map[string]int64)
 	legacySubsets := make(map[string]map[string]struct{})
+	staleNonPersonalizedSubsets := make(map[string]struct{})
+	staleCollaborativeSubsets := make(map[string]struct{})
 	err := m.CacheClient.ScanScores(ctx, func(collection, id, subset string, timestamp time.Time) error {
 		documentCounts[cacheDocumentLabel(collection, subset)]++
 		switch collection {
@@ -1314,16 +1322,11 @@ func (m *Master) collectGarbage(parent context.Context, dataSet *dataset.Dataset
 			if !lo.ContainsBy(m.Config.Recommend.NonPersonalized, func(cfg config.NonPersonalizedConfig) bool {
 				return cfg.Name == subset
 			}) {
-				return m.CacheClient.DeleteScores(ctx, []string{cache.NonPersonalized}, cache.ScoreCondition{
-					Subset: new(subset),
-				})
+				staleNonPersonalizedSubsets[subset] = struct{}{}
 			}
 		case cache.CollaborativeFiltering:
 			if dataSet.GetUserDict().Id(subset) == dataset.NotId {
-				return m.CacheClient.DeleteScores(ctx, []string{cache.CollaborativeFiltering}, cache.ScoreCondition{
-					Subset: new(subset),
-					Before: new(dataSet.GetTimestamp()),
-				})
+				staleCollaborativeSubsets[subset] = struct{}{}
 			}
 		}
 		return nil
@@ -1344,6 +1347,25 @@ func (m *Master) collectGarbage(parent context.Context, dataSet *dataset.Dataset
 		log.Logger().Info("reclaimed legacy neighbor documents from cache store",
 			zap.String("collection", collection),
 			zap.Int64("n_documents", documentCounts[collection]))
+	}
+	// Pipelined Redis scans materialize a page before invoking callbacks. Deleting
+	// a whole subset from a callback therefore repeats the same expensive search
+	// and delete for every prefetched row. Stage and deduplicate all deletions until
+	// after scanning, which also preserves SCAN iteration semantics.
+	for subset := range staleNonPersonalizedSubsets {
+		if err = m.CacheClient.DeleteScores(ctx, []string{cache.NonPersonalized}, cache.ScoreCondition{
+			Subset: new(subset),
+		}); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	for subset := range staleCollaborativeSubsets {
+		if err = m.CacheClient.DeleteScores(ctx, []string{cache.CollaborativeFiltering}, cache.ScoreCondition{
+			Subset: new(subset),
+			Before: new(dataSet.GetTimestamp()),
+		}); err != nil {
+			return errors.WithStack(err)
+		}
 	}
 	return nil
 }

@@ -172,17 +172,14 @@ func SetLogger(flagSet *pflag.FlagSet, debug bool) {
 
 const mysqlPrefix = "mysql://"
 
-// RedactSecret preserves the first three and last four characters of long secrets.
-// Secrets of seven characters or fewer are masked entirely; empty values stay empty.
+// RedactSecret masks every non-empty secret completely. Partial masking reveals too
+// much of short API keys and default credentials, and the dashboard only needs a
+// stable sentinel to restore an unchanged secret on save.
 func RedactSecret(value string) string {
 	if value == "" {
 		return ""
 	}
-	characters := []rune(value)
-	if len(characters) <= 7 {
-		return "******"
-	}
-	return string(characters[:3]) + "******" + string(characters[len(characters)-4:])
+	return "******"
 }
 
 // RedactDBURL masks credentials while preserving database addresses and options.
@@ -209,8 +206,11 @@ func RedactDBURL(rawURL string) string {
 		}
 		return strings.ReplaceAll(mysqlPrefix+parsed.FormatDSN(), "%2A", "*")
 	}
-	// SQLite and Xvec use filesystem paths; preserve them verbatim.
-	if strings.HasPrefix(rawURL, "sqlite://") || strings.HasPrefix(rawURL, "xvec://") {
+	// SQLite, Xvec and the VideoHub HNSW store use filesystem paths; preserve them
+	// verbatim. In particular, absolute hnsw:/// paths have no URL host and would
+	// otherwise be rejected as malformed during dashboard redaction.
+	if strings.HasPrefix(rawURL, "sqlite://") || strings.HasPrefix(rawURL, "xvec://") ||
+		strings.HasPrefix(rawURL, "hnsw://") {
 		return rawURL
 	}
 	// net/url does not support MongoDB authorities containing multiple IPv6 hosts.
