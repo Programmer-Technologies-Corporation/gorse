@@ -8,7 +8,9 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"time"
 
+	mysqldriver "github.com/go-sql-driver/mysql"
 	"github.com/gorse-io/gorse/storage"
 	"github.com/pkg/errors"
 	"gorm.io/gorm"
@@ -115,6 +117,73 @@ func (d *SQLDatabase) saveViewCount(tx *gorm.DB, itemId string, count *int64, pr
 	}).Create(&sqlItemViewCount{ItemId: itemId, ViewCount: *count, ProjectionHash: projectionHash}).Error
 }
 
+func sameSQLItemProjection(left, right SQLItem) bool {
+	return left.ItemId == right.ItemId &&
+		left.IsHidden == right.IsHidden &&
+		sameJSONProjection(left.Categories, right.Categories) &&
+		left.Timestamp.Equal(right.Timestamp) &&
+		sameJSONProjection(left.Labels, right.Labels) &&
+		left.Comment == right.Comment
+}
+
+// MySQL's JSON columns may return semantically identical objects with a
+// different key order or insignificant whitespace than encoding/json emitted.
+// Preserve number spellings while canonicalizing so large integer labels are
+// never made equal through float64 rounding.
+func sameJSONProjection(left, right string) bool {
+	if left == right {
+		return true
+	}
+	canonical := func(value string) (string, bool) {
+		var decoded any
+		decoder := json.NewDecoder(strings.NewReader(value))
+		decoder.UseNumber()
+		if err := decoder.Decode(&decoded); err != nil {
+			return "", false
+		}
+		encoded, err := json.Marshal(decoded)
+		return string(encoded), err == nil
+	}
+	canonicalLeft, leftOK := canonical(left)
+	canonicalRight, rightOK := canonical(right)
+	return leftOK && rightOK && canonicalLeft == canonicalRight
+}
+
+const ordinaryItemDeadlockRetries = 8
+
+func isMySQLDeadlock(err error) bool {
+	var mysqlError *mysqldriver.MySQLError
+	return errors.As(err, &mysqlError) && mysqlError.Number == 1213
+}
+
+func retryMySQLDeadlocksWithBackoff(ctx context.Context, operation func() error, backoff func(context.Context, int) error) error {
+	for attempt := 0; ; attempt++ {
+		err := operation()
+		if err == nil || !isMySQLDeadlock(err) || attempt == ordinaryItemDeadlockRetries {
+			return err
+		}
+		if err = backoff(ctx, attempt); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+}
+
+func retryMySQLDeadlocks(ctx context.Context, operation func() error) error {
+	return retryMySQLDeadlocksWithBackoff(ctx, operation, func(ctx context.Context, attempt int) error {
+		// Only the deadlock victim retries; a small per-attempt delay and
+		// clock jitter keep several victims from immediately colliding again
+		// under SERIALIZABLE while keeping the retry window bounded.
+		delay := time.Duration(attempt+1)*20*time.Millisecond +
+			time.Duration(time.Now().UnixNano()%int64(20*time.Millisecond))
+		select {
+		case <-time.After(delay):
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	})
+}
+
 func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Item) error {
 	// Preserve first-duplicate-wins semantics and lock in a consistent order.
 	unique := make(map[string]Item, len(items))
@@ -140,26 +209,60 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 	}
 	decisions := viewCountDecisions{}
 	if !containsTwitchLive {
-		rows := make([]SQLItem, 0, len(ids))
+		rows := make(map[string]SQLItem, len(ids))
 		for _, id := range ids {
 			row := NewSQLItem(unique[id])
 			row.Timestamp = d.normalizeTimestampForWrite(row.Timestamp)
-			rows = append(rows, row)
+			rows[id] = row
 		}
 		decisions.evaluate(ViewCountBranchUnsplittable, len(ids))
-		err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-			if err := tx.Clauses(clause.OnConflict{
-				Columns:   []clause.Column{{Name: "item_id"}},
-				DoUpdates: clause.AssignmentColumns([]string{"is_hidden", "categories", "time_stamp", "labels", "comment"}),
-			}).Create(rows).Error; err != nil {
-				return err
+		var committedProjectionDecisions itemProjectionDecisions
+		err := retryMySQLDeadlocks(ctx, func() error {
+			projectionDecisions := itemProjectionDecisions{}
+			err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+				var existing []SQLItem
+				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+					Where("item_id IN ?", ids).Order("item_id").Find(&existing).Error; err != nil {
+					return err
+				}
+				byID := make(map[string]SQLItem, len(existing))
+				for _, row := range existing {
+					byID[row.ItemId] = row
+				}
+				changed := make([]SQLItem, 0, len(rows))
+				for _, id := range ids {
+					current, exists := byID[id]
+					switch {
+					case !exists:
+						projectionDecisions.evaluate(ItemProjectionBranchCreated)
+						changed = append(changed, rows[id])
+					case sameSQLItemProjection(current, rows[id]):
+						projectionDecisions.evaluate(ItemProjectionBranchUnchanged)
+					default:
+						projectionDecisions.evaluate(ItemProjectionBranchChanged)
+						changed = append(changed, rows[id])
+					}
+				}
+				if len(changed) > 0 {
+					if err := tx.Clauses(clause.OnConflict{
+						Columns:   []clause.Column{{Name: "item_id"}},
+						DoUpdates: clause.AssignmentColumns([]string{"is_hidden", "categories", "time_stamp", "labels", "comment"}),
+					}).Create(changed).Error; err != nil {
+						return err
+					}
+				}
+				return tx.Table(d.itemViewCountsTable()).Where("item_id IN ?", ids).Delete(&sqlItemViewCount{}).Error
+			})
+			if err == nil {
+				committedProjectionDecisions = projectionDecisions
 			}
-			return tx.Table(d.itemViewCountsTable()).Where("item_id IN ?", ids).Delete(&sqlItemViewCount{}).Error
+			return err
 		})
 		if err != nil {
 			return err
 		}
 		decisions.committed()
+		committedProjectionDecisions.committed()
 		return nil
 	}
 	err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
@@ -253,6 +356,7 @@ func (d *SQLDatabase) PatchItemLabelsAtomic(ctx context.Context, itemId string, 
 		return Item{}, false, nil
 	}
 	var item Item
+	changed := false
 	err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Lock the base row first, matching all full-item/count writers.
 		var row SQLItem
@@ -305,10 +409,24 @@ func (d *SQLDatabase) PatchItemLabelsAtomic(ctx context.Context, itemId string, 
 		if err != nil {
 			return err
 		}
+		if sameJSONProjection(row.Labels, string(encoded)) {
+			// The merged labels may have changed only the separately stored
+			// view count (including deleting it), so preserve that transition
+			// while avoiding an identical base-row update.
+			return d.saveViewCount(tx, itemId, count, originalHash[:], false)
+		}
+		changed = true
 		if err = tx.Model(&SQLItem{}).Where("item_id = ?", itemId).Update("labels", string(encoded)).Error; err != nil {
 			return err
 		}
 		return d.saveViewCount(tx, itemId, count, originalHash[:], false)
 	})
+	if err == nil {
+		result := "unchanged"
+		if changed {
+			result = "changed"
+		}
+		ItemLabelPatchCommitsTotal.WithLabelValues(result).Inc()
+	}
 	return item, true, errors.WithStack(err)
 }

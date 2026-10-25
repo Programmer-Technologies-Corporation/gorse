@@ -60,6 +60,42 @@ func expectBranch(t *testing.T, branch string, fn func()) {
 	require.Equal(t, map[string]float64{branch: 1}, committed)
 }
 
+func counterDelta(t *testing.T, counter *prometheus.CounterVec, label string, fn func()) float64 {
+	t.Helper()
+	read := func() float64 {
+		var metric dto.Metric
+		require.NoError(t, counter.WithLabelValues(label).Write(&metric))
+		return metric.Counter.GetValue()
+	}
+	before := read()
+	fn()
+	return read() - before
+}
+
+func projectionBranchCounts(t *testing.T) map[string]float64 {
+	t.Helper()
+	out := make(map[string]float64, len(data.ItemProjectionBranches))
+	for _, branch := range data.ItemProjectionBranches {
+		var metric dto.Metric
+		require.NoError(t, data.ItemProjectionCommitsTotal.WithLabelValues(branch).Write(&metric))
+		out[branch] = metric.Counter.GetValue()
+	}
+	return out
+}
+
+func countProjectionCommits(t *testing.T, fn func()) map[string]float64 {
+	t.Helper()
+	before := projectionBranchCounts(t)
+	fn()
+	committed := map[string]float64{}
+	for branch, after := range projectionBranchCounts(t) {
+		if delta := after - before[branch]; delta != 0 {
+			committed[branch] = delta
+		}
+	}
+	return committed
+}
+
 func countFixture(t *testing.T) (data.Database, data.Database, *sql.DB, string) {
 	t.Helper()
 	uri := os.Getenv("TWITCH_COUNT_MYSQL_URI")
@@ -91,6 +127,108 @@ func liveItem(id string, count int64) data.Item {
 func viewCount(t *testing.T, item data.Item) float64 {
 	t.Helper()
 	return item.Labels.(map[string]any)["viewCount"].(float64)
+}
+
+func TestMySQLIdenticalItemProjectionAndLabelPatchArePersistentNoOps(t *testing.T) {
+	ctx := context.Background()
+	_, modern, _, _ := countFixture(t)
+	require.NoError(t, modern.Init())
+	item := data.Item{
+		ItemId: "stable", Categories: []string{"video"},
+		Timestamp: time.Date(2026, 10, 25, 20, 0, 0, 987654321, time.UTC),
+		Comment:   "unchanged",
+		Labels: map[string]any{
+			"embedding": []float64{0.25, 0.5},
+			"keep":      "yes",
+			"rank":      1,
+		},
+	}
+	require.Equal(t, float64(1), counterDelta(t, data.ItemProjectionCommitsTotal, data.ItemProjectionBranchCreated, func() {
+		require.NoError(t, modern.BatchInsertItems(ctx, []data.Item{item}))
+	}))
+
+	// Map order and equivalent JSON number types produce the same canonical SQL projection.
+	identical := item
+	identical.Labels = map[string]any{
+		"rank": json.Number("1"), "keep": "yes", "embedding": []any{json.Number("0.25"), json.Number("0.5")},
+	}
+	require.Equal(t, float64(1), counterDelta(t, data.ItemProjectionCommitsTotal, data.ItemProjectionBranchUnchanged, func() {
+		require.NoError(t, modern.BatchInsertItems(ctx, []data.Item{identical}))
+	}))
+
+	changed := identical
+	changed.Comment = "changed"
+	require.Equal(t, float64(1), counterDelta(t, data.ItemProjectionCommitsTotal, data.ItemProjectionBranchChanged, func() {
+		require.NoError(t, modern.BatchInsertItems(ctx, []data.Item{changed}))
+	}))
+
+	patcher := modern.(data.AtomicItemLabelPatcher)
+	require.Equal(t, float64(1), counterDelta(t, data.ItemLabelPatchCommitsTotal, "unchanged", func() {
+		_, handled, err := patcher.PatchItemLabelsAtomic(ctx, item.ItemId,
+			map[string]any{"embedding": []float64{0.25, 0.5}}, func(data.Item) error { return nil })
+		require.True(t, handled)
+		require.NoError(t, err)
+	}))
+	require.Equal(t, float64(1), counterDelta(t, data.ItemLabelPatchCommitsTotal, "changed", func() {
+		_, handled, err := patcher.PatchItemLabelsAtomic(ctx, item.ItemId,
+			map[string]any{"embedding": []float64{0.75, 0.875}}, func(data.Item) error { return nil })
+		require.True(t, handled)
+		require.NoError(t, err)
+	}))
+	stored, err := modern.GetItem(ctx, item.ItemId)
+	require.NoError(t, err)
+	require.Equal(t, "yes", stored.Labels.(map[string]any)["keep"])
+	require.Equal(t, []any{0.75, 0.875}, stored.Labels.(map[string]any)["embedding"])
+}
+
+func TestMySQLTwitchViewCountsRetryConcurrentOrdinaryInsertDeadlocks(t *testing.T) {
+	uri := os.Getenv("TWITCH_COUNT_MYSQL_URI")
+	if uri == "" {
+		t.Skip("TWITCH_COUNT_MYSQL_URI is not set")
+	}
+	ctx := context.Background()
+	for _, isolation := range []string{"REPEATABLE-READ", "SERIALIZABLE"} {
+		t.Run(isolation, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(ctx, 45*time.Second)
+			t.Cleanup(cancel)
+			prefix := fmt.Sprintf("vc_deadlock_%d_", time.Now().UnixNano())
+			db, err := data.Open(uri, prefix, storage.WithIsolationLevel(isolation), storage.WithSeparateTwitchViewCounts(true))
+			require.NoError(t, err)
+			require.NoError(t, db.Init())
+			t.Cleanup(func() {
+				require.NoError(t, db.Purge())
+				require.NoError(t, db.Close())
+			})
+
+			const writers, itemsPerWriter = 4, 50
+			for round := 0; round < 5; round++ {
+				start := make(chan struct{})
+				errs := make(chan error, writers)
+				ids := make([]string, 0, writers*itemsPerWriter)
+				for writer := 0; writer < writers; writer++ {
+					batch := make([]data.Item, 0, itemsPerWriter)
+					for item := 0; item < itemsPerWriter; item++ {
+						id := fmt.Sprintf("gap-%02d-%04d", round, item*writers+writer)
+						ids = append(ids, id)
+						batch = append(batch, data.Item{ItemId: id, Categories: []string{"video"},
+							Timestamp: time.Date(2026, 10, 25, 20, 0, 0, 0, time.UTC),
+							Labels:    map[string]any{"platform": "youtube", "embedding": []float64{0.25, 0.5}}})
+					}
+					go func(items []data.Item) {
+						<-start
+						errs <- db.BatchInsertItems(ctx, items)
+					}(batch)
+				}
+				close(start)
+				for writer := 0; writer < writers; writer++ {
+					require.NoError(t, <-errs)
+				}
+				stored, err := db.BatchGetItems(ctx, ids, data.GetOptions{})
+				require.NoError(t, err)
+				require.Len(t, stored, writers*itemsPerWriter)
+			}
+		})
+	}
 }
 
 func sortedFeatures(labels any) []ctr.Label {

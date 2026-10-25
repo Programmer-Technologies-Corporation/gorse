@@ -165,6 +165,20 @@ func (suite *ServerTestSuite) TestPatchItemLabels() {
 	suite.NoError(err)
 	suite.Require().Len(stored, 1)
 	suite.Equal([]float32{1, 0}, stored[0].Values)
+	// Repeating the same logical patch still heals derived index loss. The
+	// split-count SQL implementation suppresses the identical persistent row
+	// update independently of this cache/index refresh.
+	suite.NoError(suite.VectorClient.DeleteVectors(ctx, vectors.ItemToItemCollection("neighbors"), time.Now().Add(time.Minute)))
+	count, err := suite.VectorClient.CountVectors(ctx, vectors.ItemToItemCollection("neighbors"))
+	suite.NoError(err)
+	suite.Zero(count)
+	apitest.New().Handler(suite.handler).Patch("/api/item/a/labels").Header("X-API-Key", apiKey).
+		JSON(map[string]any{"embedding": []float64{1, 0}}).
+		Expect(suite.T()).Status(http.StatusOK).End()
+	stored, err = suite.VectorClient.GetVectors(ctx, vectors.ItemToItemCollection("neighbors"), []string{"a"})
+	suite.NoError(err)
+	suite.Require().Len(stored, 1)
+	suite.Equal([]float32{1, 0}, stored[0].Values)
 	// the modify timestamp is refreshed
 	modified, err := suite.CacheClient.Get(ctx, cache.Key(cache.LastModifyItemTime, "a")).Time()
 	suite.NoError(err)
