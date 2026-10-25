@@ -32,6 +32,16 @@ const (
 	ViewCountBranchUnsplittable = "unsplittable"
 )
 
+const (
+	ItemProjectionBranchCreated   = "created"
+	ItemProjectionBranchChanged   = "changed"
+	ItemProjectionBranchUnchanged = "unchanged"
+)
+
+var ItemProjectionBranches = []string{
+	ItemProjectionBranchCreated, ItemProjectionBranchChanged, ItemProjectionBranchUnchanged,
+}
+
 // ViewCountBranches lists every branch so series exist at zero.
 var ViewCountBranches = []string{
 	ViewCountBranchShortPath, ViewCountBranchFullChangedSource, ViewCountBranchLegacyConversion,
@@ -50,6 +60,18 @@ var (
 		Namespace: "gorse", Subsystem: "data", Name: "twitch_view_count_commits_total",
 		Help: "Item writes whose transaction committed, by the same branch as the decisions counter; a rolled-back write is never counted here.",
 	}, []string{"branch"})
+	ItemProjectionDecisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "gorse", Subsystem: "data", Name: "item_projection_decisions_total",
+		Help: "Ordinary item projections evaluated by the MySQL writer, including unchanged projections that avoid a persistent row write.",
+	}, []string{"branch"})
+	ItemProjectionCommitsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "gorse", Subsystem: "data", Name: "item_projection_commits_total",
+		Help: "Ordinary item projection decisions whose transaction committed.",
+	}, []string{"branch"})
+	ItemLabelPatchCommitsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: "gorse", Subsystem: "data", Name: "item_label_patch_commits_total",
+		Help: "Atomic item label patches whose transaction committed, split by whether the persistent labels changed.",
+	}, []string{"result"})
 )
 
 func init() {
@@ -57,6 +79,12 @@ func init() {
 		TwitchViewCountDecisionsTotal.WithLabelValues(branch)
 		TwitchViewCountCommitsTotal.WithLabelValues(branch)
 	}
+	for _, branch := range ItemProjectionBranches {
+		ItemProjectionDecisionsTotal.WithLabelValues(branch)
+		ItemProjectionCommitsTotal.WithLabelValues(branch)
+	}
+	ItemLabelPatchCommitsTotal.WithLabelValues("changed")
+	ItemLabelPatchCommitsTotal.WithLabelValues("unchanged")
 }
 
 // viewCountWriteState is what the writer learned about one item while holding
@@ -103,5 +131,18 @@ func (d viewCountDecisions) evaluate(branch string, n int) {
 func (d viewCountDecisions) committed() {
 	for branch, n := range d {
 		TwitchViewCountCommitsTotal.WithLabelValues(branch).Add(float64(n))
+	}
+}
+
+type itemProjectionDecisions map[string]int
+
+func (d itemProjectionDecisions) evaluate(branch string) {
+	ItemProjectionDecisionsTotal.WithLabelValues(branch).Inc()
+	d[branch]++
+}
+
+func (d itemProjectionDecisions) committed() {
+	for branch, n := range d {
+		ItemProjectionCommitsTotal.WithLabelValues(branch).Add(float64(n))
 	}
 }

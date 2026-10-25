@@ -220,7 +220,15 @@ JSON object body. Top-level keys are merged into the existing label object,
 the item's last-modify time and, with incremental item-to-item enabled, re-indexes
 the vector. Items whose labels are a legacy string array cannot be merged (400).
 Concurrent patches of the same item are serialised with a striped lock inside the
-node; `gorse_server_label_patch_total{result}` counts outcomes.
+node. With split-count MySQL storage, the merge also holds the database row lock:
+an identical canonical label object performs no persistent item/count write, but
+the endpoint still refreshes cache and vector indexes so a lost derived index can
+heal. Ordinary item batches use the same normalized SQL projection comparison and
+skip unchanged rows without changing the API's acknowledged row count.
+`gorse_server_label_patch_total{result}` counts endpoint outcomes;
+`gorse_data_item_label_patch_commits_total{result="changed"|"unchanged"}` and
+`gorse_data_item_projection_commits_total{branch="created"|"changed"|"unchanged"}`
+expose persistent-write decisions without item-level labels.
 
 ## 5. Instrumentation
 
@@ -242,6 +250,7 @@ master, worker and server HTTP ports).
 | ranking failures               | `gorse_worker_ranking_failures_total{reason}`, `gorse_worker_recommend_panics_total`           |
 | incremental indexing           | `gorse_server_item_vector_index_total{recommender,result}`, `gorse_server_item_to_item_fallback_total{recommender,result}` |
 | label patches                  | `gorse_server_label_patch_total{result}`                                                       |
+| persistent item writes         | `gorse_data_item_label_patch_commits_total{result}`, `gorse_data_item_projection_commits_total{branch}` |
 | clamped queries                | `gorse_server_query_n_clamped_total`                                                           |
 
 ## 6. Bounded-memory operation

@@ -115,18 +115,30 @@ func TestMySQLTwitchViewCountWriteVolume(t *testing.T) {
 		item.Labels.(map[string]any)["description"] = "Synthetic benchmark item; no production data."
 		return item
 	}
+	makeOrdinaryItem := func(id int, comment string) data.Item {
+		return data.Item{
+			ItemId:     fmt.Sprintf("00000000-0000-0000-0000-%012d", id),
+			Categories: []string{"format:video"},
+			Timestamp:  time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC),
+			Comment:    comment,
+			Labels: map[string]any{"platform": "youtube", "externalKind": "Video", "embedding": vector,
+				"description": "Synthetic benchmark item; no production data."},
+		}
+	}
 	type result struct {
-		Mode          string             `json:"mode"`
-		Operations    int                `json:"operations"`
-		Seconds       float64            `json:"statement_seconds"`
-		BinlogBytes   uint64             `json:"binlog_bytes"`
-		Before        writeSnapshot      `json:"before"`
-		After         writeSnapshot      `json:"after"`
-		VerifiedItems int                `json:"verified_items"`
-		Decisions     map[string]float64 `json:"committed_decisions_by_branch"`
+		Mode                string             `json:"mode"`
+		Operations          int                `json:"operations"`
+		Seconds             float64            `json:"statement_seconds"`
+		BinlogBytes         uint64             `json:"binlog_bytes"`
+		Before              writeSnapshot      `json:"before"`
+		After               writeSnapshot      `json:"after"`
+		VerifiedItems       int                `json:"verified_items"`
+		ViewCountDecisions  map[string]float64 `json:"committed_view_count_decisions_by_branch,omitempty"`
+		ProjectionDecisions map[string]float64 `json:"committed_projection_decisions_by_branch,omitempty"`
+		LabelPatchCommits   map[string]float64 `json:"committed_label_patch_results,omitempty"`
 	}
 	results := []result{}
-	for _, mode := range []string{"legacy_changed", "split_changed", "legacy_identical", "split_identical", "split_changed", "legacy_changed"} {
+	for _, mode := range []string{"legacy_changed", "split_changed", "legacy_identical", "split_identical", "split_changed", "legacy_changed", "ordinary_changed", "ordinary_identical", "ordinary_identical", "ordinary_changed", "patch_changed", "patch_identical", "patch_identical", "patch_changed"} {
 		_, err := db.Exec("DELETE FROM " + prefix + "items")
 		require.NoError(t, err)
 		store := legacy
@@ -134,10 +146,16 @@ func TestMySQLTwitchViewCountWriteVolume(t *testing.T) {
 		if strings.HasPrefix(mode, "split_") {
 			store = modern
 			writeCtx = data.WithTwitchLiveProjection(ctx)
+		} else if strings.HasPrefix(mode, "ordinary_") || strings.HasPrefix(mode, "patch_") {
+			store = modern
 		}
 		seed := make([]data.Item, 100)
 		for i := range seed {
-			seed[i] = makeItem(i, 1000)
+			if strings.HasPrefix(mode, "ordinary_") || strings.HasPrefix(mode, "patch_") {
+				seed[i] = makeOrdinaryItem(i, "stable")
+			} else {
+				seed[i] = makeItem(i, 1000)
+			}
 		}
 		require.NoError(t, store.BatchInsertItems(writeCtx, seed))
 		settleWrites(t, db)
@@ -147,22 +165,72 @@ func TestMySQLTwitchViewCountWriteVolume(t *testing.T) {
 		// The committed branch counters tie the measured bytes to the actual
 		// eligibility decision: a split arm is only meaningful if every one of
 		// its 1000 writes took the short path after the seed conversion.
-		_, committed := countDecisions(t, func() {
+		writeWorkload := func() {
 			for round := 0; round < 10; round++ {
 				count := int64(1001 + round)
 				if strings.HasSuffix(mode, "identical") {
 					count = 1000
 				}
 				for i := 0; i < 100; i++ {
-					require.NoError(t, store.BatchInsertItems(writeCtx, []data.Item{makeItem(i, count)}))
+					if strings.HasPrefix(mode, "patch_") {
+						embedding := vector
+						if strings.HasSuffix(mode, "changed") {
+							embedding = append([]float64(nil), vector...)
+							if round%2 == 0 {
+								embedding[0] = -0.75
+							} else {
+								embedding[0] = 0.75
+							}
+						}
+						_, handled, err := store.(data.AtomicItemLabelPatcher).PatchItemLabelsAtomic(ctx,
+							makeOrdinaryItem(i, "stable").ItemId, map[string]any{"embedding": embedding}, func(data.Item) error { return nil })
+						require.True(t, handled)
+						require.NoError(t, err)
+						continue
+					}
+					item := makeItem(i, count)
+					if strings.HasPrefix(mode, "ordinary_") {
+						comment := "stable"
+						if strings.HasSuffix(mode, "changed") {
+							comment = fmt.Sprintf("changed-%d", round)
+						}
+						item = makeOrdinaryItem(i, comment)
+					}
+					require.NoError(t, store.BatchInsertItems(writeCtx, []data.Item{item}))
 				}
 			}
 			seconds = time.Since(started).Seconds()
-		})
+		}
+		var committed, projectionCommitted, labelPatchCommitted map[string]float64
+		if strings.HasPrefix(mode, "ordinary_") {
+			projectionCommitted = countProjectionCommits(t, writeWorkload)
+		} else if strings.HasPrefix(mode, "patch_") {
+			result := "unchanged"
+			if strings.HasSuffix(mode, "changed") {
+				result = "changed"
+			}
+			labelPatchCommitted = map[string]float64{result: counterDelta(t, data.ItemLabelPatchCommitsTotal, result, writeWorkload)}
+		} else {
+			_, committed = countDecisions(t, writeWorkload)
+		}
 		if strings.HasPrefix(mode, "split_") {
 			require.Equal(t, map[string]float64{data.ViewCountBranchShortPath: 1000}, committed)
 		} else {
 			require.Empty(t, committed, "the split-OFF writer must not report decisions")
+		}
+		if strings.HasPrefix(mode, "ordinary_") {
+			branch := data.ItemProjectionBranchUnchanged
+			if strings.HasSuffix(mode, "changed") {
+				branch = data.ItemProjectionBranchChanged
+			}
+			require.Equal(t, map[string]float64{branch: 1000}, projectionCommitted)
+		}
+		if strings.HasPrefix(mode, "patch_") {
+			result := "unchanged"
+			if strings.HasSuffix(mode, "changed") {
+				result = "changed"
+			}
+			require.Equal(t, map[string]float64{result: 1000}, labelPatchCommitted)
 		}
 		settleWrites(t, db)
 		after := benchmarkSnapshot(t, db, container, dockerContext)
@@ -177,6 +245,23 @@ func TestMySQLTwitchViewCountWriteVolume(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, items, 100)
 		for _, item := range items {
+			if strings.HasPrefix(mode, "patch_") {
+				embedding := item.Labels.(map[string]any)["embedding"].([]any)
+				expected := vector[0]
+				if strings.HasSuffix(mode, "changed") {
+					expected = 0.75
+				}
+				require.Equal(t, expected, embedding[0])
+				continue
+			}
+			if strings.HasPrefix(mode, "ordinary_") {
+				expected := "stable"
+				if strings.HasSuffix(mode, "changed") {
+					expected = "changed-9"
+				}
+				require.Equal(t, expected, item.Comment)
+				continue
+			}
 			expected := float64(1010)
 			if strings.HasSuffix(mode, "identical") {
 				expected = 1000
@@ -191,7 +276,10 @@ func TestMySQLTwitchViewCountWriteVolume(t *testing.T) {
 				return out
 			}())
 		}
-		results = append(results, result{mode, 1000, seconds, after.Position - before.Position, before, after, len(items), committed})
+		results = append(results, result{Mode: mode, Operations: 1000, Seconds: seconds,
+			BinlogBytes: after.Position - before.Position, Before: before, After: after,
+			VerifiedItems: len(items), ViewCountDecisions: committed, ProjectionDecisions: projectionCommitted,
+			LabelPatchCommits: labelPatchCommitted})
 		t.Logf("%s: %d binlog bytes over 1000 actual datastore writes", mode, after.Position-before.Position)
 	}
 	receipt := map[string]any{"mysql_version": version, "binlog_format": format, "binlog_row_image": image, "partial_json": partial, "compression": compression, "items": 100, "embedding_dimensions": len(vector), "results": results,

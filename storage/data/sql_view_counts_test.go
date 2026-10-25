@@ -3,10 +3,26 @@ package data
 import (
 	"encoding/json"
 	"testing"
+	"time"
 
 	"github.com/gorse-io/gorse/storage"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSameSQLItemProjectionUsesCanonicalContent(t *testing.T) {
+	instant := time.Date(2026, 10, 25, 20, 0, 0, 0, time.UTC)
+	left := NewSQLItem(Item{ItemId: "item", Timestamp: instant, Categories: []string{"video"}, Labels: map[string]any{"b": 2, "a": 1}})
+	right := NewSQLItem(Item{ItemId: "item", Timestamp: instant.In(time.FixedZone("offset", -7*60*60)), Categories: []string{"video"}, Labels: map[string]any{"a": json.Number("1"), "b": json.Number("2")}})
+	require.True(t, sameSQLItemProjection(left, right), "map order, JSON number representation, and time location are not logical changes")
+	right.Categories = `[ "video" ]`
+	right.Labels = `{ "b": 2, "a": 1 }`
+	require.True(t, sameSQLItemProjection(left, right), "database JSON whitespace and key order are not logical changes")
+	right.Labels = `{"a":9007199254740993,"b":2}`
+	require.False(t, sameSQLItemProjection(left, right), "large JSON integers must not compare through float64 rounding")
+	right.Labels = left.Labels
+	right.Comment = "changed"
+	require.False(t, sameSQLItemProjection(left, right))
+}
 
 func TestSplitTwitchViewCount(t *testing.T) {
 	for _, test := range []struct {
