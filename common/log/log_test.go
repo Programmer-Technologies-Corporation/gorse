@@ -85,15 +85,15 @@ func TestRedactSecret(t *testing.T) {
 	assert.Empty(t, RedactSecret(""))
 	assert.Equal(t, "******", RedactSecret("a"))
 	assert.Equal(t, "******", RedactSecret("abcdefg"))
-	assert.Equal(t, "abc******efgh", RedactSecret("abcdefgh"))
-	assert.Equal(t, "abc******ijkl", RedactSecret("abcdefghijkl"))
+	assert.Equal(t, "******", RedactSecret("abcdefgh"))
+	assert.Equal(t, "******", RedactSecret("abcdefghijkl"))
 	assert.Equal(t, "******", RedactSecret("甲乙丙丁戊己庚"))
-	assert.Equal(t, "甲乙丙******戊己庚辛", RedactSecret("甲乙丙丁戊己庚辛"))
+	assert.Equal(t, "******", RedactSecret("甲乙丙丁戊己庚辛"))
 
 	assert.Equal(t, "******", RedactSecret("******"))
-	assert.Equal(t, "abc******efgh", RedactSecret("abc******efgh"))
-	assert.Equal(t, "abc******ijkl", RedactSecret("abc******ijkl"))
-	assert.Equal(t, "甲乙丙******戊己庚辛", RedactSecret("甲乙丙******戊己庚辛"))
+	assert.Equal(t, "******", RedactSecret("abc******efgh"))
+	assert.Equal(t, "******", RedactSecret("abc******ijkl"))
+	assert.Equal(t, "******", RedactSecret("甲乙丙******戊己庚辛"))
 }
 
 func TestRedactDBURL(t *testing.T) {
@@ -108,11 +108,15 @@ func TestRedactDBURL(t *testing.T) {
 		RedactDBURL("xvec://data/vectors"))
 	assert.Equal(t, `xvec://C:\data\vectors`,
 		RedactDBURL(`xvec://C:\data\vectors`))
-	assert.Equal(t, "mysql://******:gor******pass@tcp(localhost:3306)/gorse?parseTime=true",
+	assert.Equal(t, "hnsw:///var/lib/gorse/master/hnsw",
+		RedactDBURL("hnsw:///var/lib/gorse/master/hnsw"))
+	assert.Equal(t, `hnsw://C:\data\hnsw`,
+		RedactDBURL(`hnsw://C:\data\hnsw`))
+	assert.Equal(t, "mysql://******:******@tcp(localhost:3306)/gorse?parseTime=true",
 		RedactDBURL("mysql://gorse:gorse_pass@tcp(localhost:3306)/gorse?parseTime=true"))
 	assert.Equal(t, "mysql://******:******@unix(/var/run/mysql.sock)/gorse?parseTime=true",
 		RedactDBURL("mysql://bob:secret@unix(/var/run/mysql.sock)/gorse?parseTime=true"))
-	assert.Equal(t, "mysql://******:p?@******#&ss@tcp(localhost:3306)/gorse",
+	assert.Equal(t, "mysql://******:******@tcp(localhost:3306)/gorse",
 		RedactDBURL("mysql://bob:p?@/#&ss@tcp(localhost:3306)/gorse"))
 	assert.Equal(t, "mysql://******:******@tcp(localhost:3306)/gorse?parseTime=true&api_key=******&password=******",
 		RedactDBURL("mysql://bob:secret@tcp(localhost:3306)/gorse?password=secret&api_key=secret&parseTime=true"))
@@ -124,7 +128,7 @@ func TestRedactDBURL(t *testing.T) {
 		RedactDBURL("postgres://bob:secret@1.2.3.4:5432/mydb?sslmode=verify-full"))
 	assert.Equal(t, "postgresql://localhost/gorse?password=******&sslmode=require&user=******",
 		RedactDBURL("postgresql://localhost/gorse?user=bob&password=secret&sslmode=require"))
-	assert.Equal(t, "postgres://localhost/gorse?passfile=%2Fet******pass&sslkey=%2Fet******.key",
+	assert.Equal(t, "postgres://localhost/gorse?passfile=******&sslkey=******",
 		RedactDBURL("postgres://localhost/gorse?passfile=/etc/pgpass&sslkey=/etc/client.key"))
 	assert.Equal(t, "postgres://localhost/gorse?client_id=frontend&credential_provider=default&password_policy=strict&tokenizer=standard&uid=report&user_id=operator",
 		RedactDBURL("postgres://localhost/gorse?client_id=frontend&credential_provider=default&password_policy=strict&tokenizer=standard&uid=report&user_id=operator"))
@@ -132,11 +136,11 @@ func TestRedactDBURL(t *testing.T) {
 		RedactDBURL("mongodb://bob:secret@host1:27017,host2:27018/gorse?replicaSet=rs0&authSource=admin"))
 	assert.Equal(t, "mongodb://******:******@[::1]:27017,[::2]:27018/gorse?replicaSet=rs0",
 		RedactDBURL("mongodb://bob:secret@[::1]:27017,[::2]:27018/gorse?replicaSet=rs0"))
-	assert.Equal(t, "mongodb+srv://******:******@cluster.example/gorse?authMechanism=MONGODB-AWS&authMechanismProperties=AWS******cret",
+	assert.Equal(t, "mongodb+srv://******:******@cluster.example/gorse?authMechanism=MONGODB-AWS&authMechanismProperties=******",
 		RedactDBURL("mongodb+srv://bob:secret@cluster.example/gorse?authMechanism=MONGODB-AWS&authMechanismProperties=AWS_SESSION_TOKEN%3Asecret"))
 	assert.Equal(t, "mongodb://localhost/gorse?tls=true&tlsCertificateKeyFilePassword=******",
 		RedactDBURL("mongodb://localhost/gorse?tls=true&tlsCertificateKeyFilePassword=secret"))
-	assert.Equal(t, "mongodb://localhost/gorse?tls=true&tlsPrivateKeyFile=%2Fet******.key",
+	assert.Equal(t, "mongodb://localhost/gorse?tls=true&tlsPrivateKeyFile=******",
 		RedactDBURL("mongodb://localhost/gorse?tls=true&tlsPrivateKeyFile=/etc/client.key"))
 	assert.Equal(t, "rediss://:******@localhost:6379/0?protocol=3",
 		RedactDBURL("rediss://:secret@localhost:6379/0?protocol=3"))
@@ -148,17 +152,17 @@ func TestRedactDBURL(t *testing.T) {
 		RedactDBURL("postgres://bob:secret@[::1]:5432/gorse"))
 	assert.Equal(t, "postgres://******:******@localhost/gorse",
 		RedactDBURL("postgres://b%40b:s%3Acr%40t@localhost/gorse"))
-	assert.Equal(t, "postgres://dat******user:dat******word@localhost/gorse",
+	assert.Equal(t, "postgres://******:******@localhost/gorse",
 		RedactDBURL("postgres://data-user:data-password@localhost/gorse"))
-	assert.Equal(t, "postgres://a%40b******defg:x%3Ay******cdef@localhost/gorse",
+	assert.Equal(t, "postgres://******:******@localhost/gorse",
 		RedactDBURL("postgres://a%40bcdefg:x%3Ayabcdef@localhost/gorse"))
 	assert.Equal(t, "qdrant://localhost:6334?api_key=******&api_key=******&timeout=5",
 		RedactDBURL("qdrant://localhost:6334?api_key=first&api_key=second&timeout=5"))
 	assert.Equal(t, "qdrant://localhost:6334?api_key=******&timeout=5",
 		RedactDBURL("qdrant://localhost:6334?%61pi_key=s%26cr%3Dt&timeout=5"))
-	assert.Equal(t, "qdrant://localhost:6334/db%2Fname?api_key=a%26b******efgh&note=a%26b%3Dc%2B",
+	assert.Equal(t, "qdrant://localhost:6334/db%2Fname?api_key=******&note=a%26b%3Dc%2B",
 		RedactDBURL("qdrant://localhost:6334/db%2Fname?api_key=a%26bcdefgh&note=a%26b%3Dc%2B"))
-	assert.Equal(t, "weaviates://localhost?access_token=abc******hijk&client_secret=abc******hijk&refresh_token=abc******hijk",
+	assert.Equal(t, "weaviates://localhost?access_token=******&client_secret=******&refresh_token=******",
 		RedactDBURL("weaviates://localhost?access_token=abcdefghijk&client_secret=abcdefghijk&refresh_token=abcdefghijk"))
 	assert.Equal(t, "postgres://localhost/gorse?user=&password=&sslmode=require",
 		RedactDBURL("postgres://localhost/gorse?user=&password=&sslmode=require"))
@@ -180,11 +184,11 @@ func TestRedactDBURL(t *testing.T) {
 	assert.Empty(t, RedactDBURL("********"))
 
 	// Already-redacted URLs remain unchanged.
-	assert.Equal(t, "mysql://******:gor******pass@tcp(localhost:3306)/gorse?parseTime=true",
+	assert.Equal(t, "mysql://******:******@tcp(localhost:3306)/gorse?parseTime=true",
 		RedactDBURL("mysql://******:gor******pass@tcp(localhost:3306)/gorse?parseTime=true"))
 	assert.Equal(t, "mysql://******:******@unix(/var/run/mysql.sock)/gorse?parseTime=true",
 		RedactDBURL("mysql://******:******@unix(/var/run/mysql.sock)/gorse?parseTime=true"))
-	assert.Equal(t, "mysql://******:p?@******#&ss@tcp(localhost:3306)/gorse",
+	assert.Equal(t, "mysql://******:******@tcp(localhost:3306)/gorse",
 		RedactDBURL("mysql://******:p?@******#&ss@tcp(localhost:3306)/gorse"))
 	assert.Equal(t, "mysql://******:******@tcp(localhost:3306)/gorse?parseTime=true&api_key=******&password=******",
 		RedactDBURL("mysql://******:******@tcp(localhost:3306)/gorse?parseTime=true&api_key=******&password=******"))
@@ -200,7 +204,7 @@ func TestRedactDBURL(t *testing.T) {
 		RedactDBURL("mongodb://******:******@host1:27017,host2:27018/gorse?replicaSet=rs0&authSource=admin"))
 	assert.Equal(t, "mongodb://******:******@[::1]:27017,[::2]:27018/gorse?replicaSet=rs0",
 		RedactDBURL("mongodb://******:******@[::1]:27017,[::2]:27018/gorse?replicaSet=rs0"))
-	assert.Equal(t, "mongodb+srv://******:******@cluster.example/gorse?authMechanism=MONGODB-AWS&authMechanismProperties=AWS******cret",
+	assert.Equal(t, "mongodb+srv://******:******@cluster.example/gorse?authMechanism=MONGODB-AWS&authMechanismProperties=******",
 		RedactDBURL("mongodb+srv://******:******@cluster.example/gorse?authMechanism=MONGODB-AWS&authMechanismProperties=AWS******cret"))
 	assert.Equal(t, "mongodb://localhost/gorse?tls=true&tlsCertificateKeyFilePassword=******",
 		RedactDBURL("mongodb://localhost/gorse?tls=true&tlsCertificateKeyFilePassword=******"))
@@ -214,15 +218,15 @@ func TestRedactDBURL(t *testing.T) {
 		RedactDBURL("postgres://******:******@[::1]:5432/gorse"))
 	assert.Equal(t, "postgres://******:******@localhost/gorse",
 		RedactDBURL("postgres://******:******@localhost/gorse"))
-	assert.Equal(t, "postgres://dat******user:dat******word@localhost/gorse",
+	assert.Equal(t, "postgres://******:******@localhost/gorse",
 		RedactDBURL("postgres://dat******user:dat******word@localhost/gorse"))
-	assert.Equal(t, "postgres://a%40b******defg:x%3Ay******cdef@localhost/gorse",
+	assert.Equal(t, "postgres://******:******@localhost/gorse",
 		RedactDBURL("postgres://a%40b******defg:x%3Ay******cdef@localhost/gorse"))
 	assert.Equal(t, "qdrant://localhost:6334?api_key=******&api_key=******&timeout=5",
 		RedactDBURL("qdrant://localhost:6334?api_key=******&api_key=******&timeout=5"))
 	assert.Equal(t, "qdrant://localhost:6334?api_key=******&timeout=5",
 		RedactDBURL("qdrant://localhost:6334?api_key=******&timeout=5"))
-	assert.Equal(t, "qdrant://localhost:6334/db%2Fname?api_key=a%26b******efgh&note=a%26b%3Dc%2B",
+	assert.Equal(t, "qdrant://localhost:6334/db%2Fname?api_key=******&note=a%26b%3Dc%2B",
 		RedactDBURL("qdrant://localhost:6334/db%2Fname?api_key=a%26b******efgh&note=a%26b%3Dc%2B"))
 	assert.Equal(t, "postgres://localhost/gorse?password=******#********",
 		RedactDBURL("postgres://localhost/gorse?password=******#********"))

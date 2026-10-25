@@ -27,6 +27,13 @@ scans), `37ee00e` (direct feedback-item lookup), `882f428` (compact item
 embeddings during dataset loading), `a9a3c1c` (dashboard secret redaction), and
 `c2b2278` (thread-safe feedback counts).
 
+The selected changes keep three fork contracts: `hnsw://` filesystem URLs pass
+through dashboard redaction while every credential is fully masked; item-label
+arrays remain in their original numeric form when a non-personalized expression
+can read them (the compact FP16 form is retained when no such recommender is
+configured); and cache garbage collection stages and deduplicates whole-subset
+deletions until after a pipelined Redis scan completes.
+
 The remaining commits through that review checkpoint are intentionally not an
 implicit upgrade backlog. In particular, the xvec HNSW/index-preparation chain
 overlaps this fork's production `hnsw://` store and existing optimize/dedup

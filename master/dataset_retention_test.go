@@ -306,6 +306,15 @@ func TestDatasetRetentionLoader(t *testing.T) {
 					for _, score := range scores {
 						require.NotEqual(t, "item-000000", score.Id)
 						require.NotEqual(t, "item-000011", score.Id)
+						var item int
+						_, err := fmt.Sscanf(score.Id, "item-%d", &item)
+						require.NoError(t, err)
+						feedbackLen := 0
+						if !noFeedback && (item == 2 || item == 3) {
+							feedbackLen = 1
+						}
+						expectedScore := float64(item-1000)/1024 + float64(feedbackLen)
+						require.InDelta(t, expectedScore, score.Score, 1e-12)
 					}
 				}
 				if noFeedback {
