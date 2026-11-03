@@ -24,11 +24,11 @@ const (
 	// A converted-shape item existed without a count row: healing full write
 	// plus count row.
 	ViewCountBranchMissingCount = "missing_count"
-	// A splittable Twitch live item written without the projection marker:
+	// A splittable item written outside the Twitch live projection intent:
 	// ordinary full replacement, even when the fingerprint matched.
 	ViewCountBranchUnmarked = "unmarked"
-	// Other providers, VODs, non-object labels or an invalid viewCount: full
-	// write, no count row kept.
+	// Outside the Twitch live fingerprint path. Ordinary batches use their
+	// own base-row comparison; YouTube Video counts may still be separate.
 	ViewCountBranchUnsplittable = "unsplittable"
 )
 
@@ -62,11 +62,11 @@ var (
 	}, []string{"branch"})
 	ItemProjectionDecisionsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "gorse", Subsystem: "data", Name: "item_projection_decisions_total",
-		Help: "Ordinary item projections evaluated by the MySQL writer, including unchanged projections that avoid a persistent row write.",
+		Help: "Ordinary base item-row projections evaluated by the MySQL writer; separate count writes are excluded.",
 	}, []string{"branch"})
 	ItemProjectionCommitsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "gorse", Subsystem: "data", Name: "item_projection_commits_total",
-		Help: "Ordinary item projection decisions whose transaction committed.",
+		Help: "Ordinary base item-row projection decisions whose transaction committed; separate count writes are excluded.",
 	}, []string{"branch"})
 	ItemLabelPatchCommitsTotal = promauto.NewCounterVec(prometheus.CounterOpts{
 		Namespace: "gorse", Subsystem: "data", Name: "item_label_patch_commits_total",
@@ -92,8 +92,8 @@ func init() {
 // both drives the write and is reported, so the metric cannot drift from the
 // actual decision.
 type viewCountWriteState struct {
-	marked          bool // request carried the twitch_live_projection intent
-	splittable      bool // labels yielded a valid Twitch live count
+	marked          bool // Twitch Live item with the twitch_live_projection intent
+	splittable      bool // labels yielded a valid separate count
 	exists          bool // item row present
 	legacyLabel     bool // stored labels still contain viewCount
 	countRow        bool // item_view_counts row present

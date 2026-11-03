@@ -1,9 +1,12 @@
-# Twitch live viewer-count storage
+# Twitch live and YouTube video count storage
 
 `database.mysql.separate_twitch_view_counts` is opt-in and defaults to false.
-It applies only to items labeled `platform=twitch`, `externalKind=Live` with a
-nonnegative integral `viewCount` representable as int64. Other labels, numeric
-forms and providers retain their existing representation and behavior.
+It applies to items labeled `platform=twitch`, `externalKind=Live`, or
+`platform=youtube`, `externalKind=Video`, with a nonnegative integral `viewCount`
+representable as int64. The existing option name is unchanged. Other labels,
+numeric forms and providers retain their existing representation and behavior.
+See [the YouTube extension and comparison benchmark](youtube-count-projections.md)
+for the upgrade from an already enabled Twitch split layout.
 
 ## Storage and contracts
 
@@ -86,7 +89,7 @@ Exactly one branch is chosen per item write, in this priority order:
 
 | branch                | meaning                                                                 |
 |-----------------------|-------------------------------------------------------------------------|
-| `unsplittable`        | other provider, VOD, non-object labels or invalid `viewCount`; full write |
+| `unsplittable`        | outside the Twitch fingerprint path; ordinary batches use base-row comparison |
 | `missing_item`        | no item row existed; insert plus count row                              |
 | `legacy_conversion`   | stored labels still held `viewCount`; first-touch full write            |
 | `missing_count`       | converted item without a count row; healing full write                  |
@@ -98,6 +101,14 @@ Steady-state eligibility is `short_path` divided by `short_path +
 full_changed_source` over committed writes, after `legacy_conversion` and
 `missing_*` have settled. Independent label patches keep the source
 fingerprint, so they do not push a projection out of `short_path`.
+
+Ordinary batches also report `gorse_data_item_projection_commits_total` with
+`created`, `changed` and `unchanged` branches for the base item row. A separately
+stored YouTube count can change while the base-row branch is `unchanged`.
+The historical Twitch counter names are retained: their `unsplittable` branch
+does not mean a YouTube count remains inline. A mixed batch containing Twitch
+live items uses the per-item path, and YouTube items remain full replacements
+there even if the request carries the Twitch projection marker.
 
 ## Activation and mixed versions
 
