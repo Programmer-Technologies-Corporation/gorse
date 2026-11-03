@@ -43,6 +43,8 @@ and first-touch conversion are outside the measurement interval.
 Count-only binlog bytes fell 99.15%; SELECT/INSERT/UPDATE/DELETE statements
 fell from 30 to 20 for the ten batches. Real metadata-plus-count changes cost
 0.43% more binlog bytes because both representations legitimately change.
+Those real metadata changes also send labels twice (comparison and upsert):
+the fixture's received SQL bytes rose from 1.72 MB to 3.43 MB in that arm.
 Identical requests still execute statements but create no row-event bytes.
 The native comparison also avoided ten unnecessary base-row upsert statements
 for 500 identical realistic float32-derived embedding projections. Those
