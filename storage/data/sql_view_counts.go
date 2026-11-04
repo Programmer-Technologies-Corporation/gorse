@@ -32,7 +32,7 @@ func IsTwitchLiveProjection(ctx context.Context) bool {
 }
 
 // View counts stay numbers in the public labels object, but frequently changing
-// Twitch live counts need not rewrite the embedding-bearing items row.
+// Twitch live and YouTube video counts need not rewrite embedding-bearing rows.
 type sqlItemViewCount struct {
 	ItemId         string `gorm:"column:item_id;primaryKey"`
 	ViewCount      int64  `gorm:"column:view_count"`
@@ -67,9 +67,10 @@ func (d *SQLDatabase) itemSelectColumns() string {
 	return "item_id, is_hidden, categories, time_stamp, " + labels + ", comment"
 }
 
-func splitTwitchViewCount(item Item) (Item, *int64, error) {
+func splitItemViewCount(item Item) (Item, *int64, error) {
 	object, ok := item.Labels.(map[string]any)
-	if !ok || object["platform"] != "twitch" || object["externalKind"] != "Live" {
+	if !ok || !((object["platform"] == "twitch" && object["externalKind"] == "Live") ||
+		(object["platform"] == "youtube" && object["externalKind"] == "Video")) {
 		return item, nil, nil
 	}
 	// Parse just the scalar with UseNumber so int64 precision is retained.
@@ -117,36 +118,33 @@ func (d *SQLDatabase) saveViewCount(tx *gorm.DB, itemId string, count *int64, pr
 	}).Create(&sqlItemViewCount{ItemId: itemId, ViewCount: *count, ProjectionHash: projectionHash}).Error
 }
 
-func sameSQLItemProjection(left, right SQLItem) bool {
-	return left.ItemId == right.ItemId &&
-		left.IsHidden == right.IsHidden &&
-		sameJSONProjection(left.Categories, right.Categories) &&
-		left.Timestamp.Equal(right.Timestamp) &&
-		sameJSONProjection(left.Labels, right.Labels) &&
-		left.Comment == right.Comment
+// Compare JSON in MySQL's stored representation. Its binary JSON -> text
+// conversion can spell the same double differently from encoding/json, so a
+// Go string comparison misclassifies real embedding vectors as changed.
+// Returning booleans instead of both JSON documents also bounds response size.
+type sqlProjectionComparison struct {
+	ItemId          string    `gorm:"column:item_id"`
+	IsHidden        bool      `gorm:"column:is_hidden"`
+	Timestamp       time.Time `gorm:"column:time_stamp"`
+	Comment         string    `gorm:"column:comment"`
+	CategoriesEqual bool      `gorm:"column:categories_equal"`
+	LabelsEqual     bool      `gorm:"column:labels_equal"`
 }
 
-// MySQL's JSON columns may return semantically identical objects with a
-// different key order or insignificant whitespace than encoding/json emitted.
-// Preserve number spellings while canonicalizing so large integer labels are
-// never made equal through float64 rounding.
-func sameJSONProjection(left, right string) bool {
-	if left == right {
-		return true
+func projectionComparisonSelect(ids []string, rows map[string]SQLItem) (string, []any) {
+	var categories, labels strings.Builder
+	categories.WriteString("CASE item_id")
+	labels.WriteString("CASE item_id")
+	categoryArgs, labelArgs := make([]any, 0, 2*len(ids)), make([]any, 0, 2*len(ids))
+	for _, id := range ids {
+		categories.WriteString(" WHEN ? THEN categories = CAST(? AS JSON)")
+		labels.WriteString(" WHEN ? THEN labels = CAST(? AS JSON)")
+		categoryArgs = append(categoryArgs, id, rows[id].Categories)
+		labelArgs = append(labelArgs, id, rows[id].Labels)
 	}
-	canonical := func(value string) (string, bool) {
-		var decoded any
-		decoder := json.NewDecoder(strings.NewReader(value))
-		decoder.UseNumber()
-		if err := decoder.Decode(&decoded); err != nil {
-			return "", false
-		}
-		encoded, err := json.Marshal(decoded)
-		return string(encoded), err == nil
-	}
-	canonicalLeft, leftOK := canonical(left)
-	canonicalRight, rightOK := canonical(right)
-	return leftOK && rightOK && canonicalLeft == canonicalRight
+	categories.WriteString(" ELSE FALSE END AS categories_equal")
+	labels.WriteString(" ELSE FALSE END AS labels_equal")
+	return "item_id, is_hidden, time_stamp, comment, " + categories.String() + ", " + labels.String(), append(categoryArgs, labelArgs...)
 }
 
 const ordinaryItemDeadlockRetries = 8
@@ -210,22 +208,34 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 	decisions := viewCountDecisions{}
 	if !containsTwitchLive {
 		rows := make(map[string]SQLItem, len(ids))
+		countRows := make([]sqlItemViewCount, 0, len(ids))
+		withoutCount := make([]string, 0, len(ids))
 		for _, id := range ids {
-			row := NewSQLItem(unique[id])
+			cold, count, err := splitItemViewCount(unique[id])
+			if err != nil {
+				return err
+			}
+			row := NewSQLItem(cold)
 			row.Timestamp = d.normalizeTimestampForWrite(row.Timestamp)
 			rows[id] = row
+			if count == nil {
+				withoutCount = append(withoutCount, id)
+			} else {
+				countRows = append(countRows, sqlItemViewCount{ItemId: id, ViewCount: *count})
+			}
 		}
 		decisions.evaluate(ViewCountBranchUnsplittable, len(ids))
+		comparisonSelect, comparisonArgs := projectionComparisonSelect(ids, rows)
 		var committedProjectionDecisions itemProjectionDecisions
 		err := retryMySQLDeadlocks(ctx, func() error {
 			projectionDecisions := itemProjectionDecisions{}
 			err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
-				var existing []SQLItem
-				if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
+				var existing []sqlProjectionComparison
+				if err := tx.Model(&SQLItem{}).Select(comparisonSelect, comparisonArgs...).Clauses(clause.Locking{Strength: "UPDATE"}).
 					Where("item_id IN ?", ids).Order("item_id").Find(&existing).Error; err != nil {
 					return err
 				}
-				byID := make(map[string]SQLItem, len(existing))
+				byID := make(map[string]sqlProjectionComparison, len(existing))
 				for _, row := range existing {
 					byID[row.ItemId] = row
 				}
@@ -236,7 +246,8 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 					case !exists:
 						projectionDecisions.evaluate(ItemProjectionBranchCreated)
 						changed = append(changed, rows[id])
-					case sameSQLItemProjection(current, rows[id]):
+					case current.CategoriesEqual && current.LabelsEqual &&
+						current.IsHidden == rows[id].IsHidden && current.Timestamp.Equal(rows[id].Timestamp) && current.Comment == rows[id].Comment:
 						projectionDecisions.evaluate(ItemProjectionBranchUnchanged)
 					default:
 						projectionDecisions.evaluate(ItemProjectionBranchChanged)
@@ -251,7 +262,20 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 						return err
 					}
 				}
-				return tx.Table(d.itemViewCountsTable()).Where("item_id IN ?", ids).Delete(&sqlItemViewCount{}).Error
+				// Both representations commit together under the base-row locks.
+				// Bulk count writes retain the ordinary batch's bounded round trips.
+				if len(countRows) > 0 {
+					if err := tx.Table(d.itemViewCountsTable()).Clauses(clause.OnConflict{
+						Columns:   []clause.Column{{Name: "item_id"}},
+						DoUpdates: clause.AssignmentColumns([]string{"view_count", "projection_hash"}),
+					}).Create(countRows).Error; err != nil {
+						return err
+					}
+				}
+				if len(withoutCount) > 0 {
+					return tx.Table(d.itemViewCountsTable()).Where("item_id IN ?", withoutCount).Delete(&sqlItemViewCount{}).Error
+				}
+				return nil
 			})
 			if err == nil {
 				committedProjectionDecisions = projectionDecisions
@@ -267,7 +291,7 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 	}
 	err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		for _, id := range ids {
-			cold, count, err := splitTwitchViewCount(unique[id])
+			cold, count, err := splitItemViewCount(unique[id])
 			if err != nil {
 				return err
 			}
@@ -279,7 +303,8 @@ func (d *SQLDatabase) insertItemsWithViewCounts(ctx context.Context, items []Ite
 				return err
 			}
 			fingerprint := sha256.Sum256(encoded)
-			state := viewCountWriteState{marked: IsTwitchLiveProjection(ctx), splittable: count != nil}
+			labels, _ := unique[id].Labels.(map[string]any)
+			state := viewCountWriteState{marked: IsTwitchLiveProjection(ctx) && labels["platform"] == "twitch" && labels["externalKind"] == "Live", splittable: count != nil}
 			var current SQLItem
 			err = tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("item_id = ?", id).Take(&current).Error
 			state.exists = err == nil
@@ -332,7 +357,7 @@ func (d *SQLDatabase) modifyItemWithViewCount(ctx context.Context, itemId string
 			} // retain ModifyItem's absent-item semantics
 			return err
 		}
-		cold, count, err := splitTwitchViewCount(Item{ItemId: itemId, Labels: patch.Labels})
+		cold, count, err := splitItemViewCount(Item{ItemId: itemId, Labels: patch.Labels})
 		if err != nil {
 			return err
 		}
@@ -360,7 +385,7 @@ func (d *SQLDatabase) PatchItemLabelsAtomic(ctx context.Context, itemId string, 
 	err := d.gormDB.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		// Lock the base row first, matching all full-item/count writers.
 		var row SQLItem
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("item_id = ?", itemId).Take(&row).Error; err != nil {
+		if err := tx.Select("item_id").Clauses(clause.Locking{Strength: "UPDATE"}).Where("item_id = ?", itemId).Take(&row).Error; err != nil {
 			if errors.Is(err, gorm.ErrRecordNotFound) {
 				return storage.ErrNotFound
 			}
@@ -371,7 +396,7 @@ func (d *SQLDatabase) PatchItemLabelsAtomic(ctx context.Context, itemId string, 
 		}
 		// Seed legacy rows with their pre-patch source fingerprint. Subsequent
 		// count-only projections must not overwrite this patch's embedding.
-		originalCold, _, err := splitTwitchViewCount(item)
+		originalCold, _, err := splitItemViewCount(item)
 		if err != nil {
 			return err
 		}
@@ -401,7 +426,7 @@ func (d *SQLDatabase) PatchItemLabelsAtomic(ctx context.Context, itemId string, 
 		if err := validate(item); err != nil {
 			return err
 		}
-		cold, count, err := splitTwitchViewCount(item)
+		cold, count, err := splitItemViewCount(item)
 		if err != nil {
 			return err
 		}
@@ -409,16 +434,14 @@ func (d *SQLDatabase) PatchItemLabelsAtomic(ctx context.Context, itemId string, 
 		if err != nil {
 			return err
 		}
-		if sameJSONProjection(row.Labels, string(encoded)) {
-			// The merged labels may have changed only the separately stored
-			// view count (including deleting it), so preserve that transition
-			// while avoiding an identical base-row update.
-			return d.saveViewCount(tx, itemId, count, originalHash[:], false)
+		// Let MySQL compare binary JSON instead of its lossy display spelling.
+		// The predicate makes an identical patch a zero-row update; RowsAffected
+		// stays correct even when the client uses CLIENT_FOUND_ROWS.
+		update := tx.Model(&SQLItem{}).Where("item_id = ? AND NOT (labels = CAST(? AS JSON))", itemId, string(encoded)).Update("labels", string(encoded))
+		if update.Error != nil {
+			return update.Error
 		}
-		changed = true
-		if err = tx.Model(&SQLItem{}).Where("item_id = ?", itemId).Update("labels", string(encoded)).Error; err != nil {
-			return err
-		}
+		changed = update.RowsAffected > 0
 		return d.saveViewCount(tx, itemId, count, originalHash[:], false)
 	})
 	if err == nil {

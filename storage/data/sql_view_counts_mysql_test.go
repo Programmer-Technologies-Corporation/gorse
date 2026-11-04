@@ -138,7 +138,7 @@ func TestMySQLIdenticalItemProjectionAndLabelPatchArePersistentNoOps(t *testing.
 		Timestamp: time.Date(2026, 10, 25, 20, 0, 0, 987654321, time.UTC),
 		Comment:   "unchanged",
 		Labels: map[string]any{
-			"embedding": []float64{0.25, 0.5},
+			"embedding": []float64{0.25, 0.5, 1e-7, -1e-8},
 			"keep":      "yes",
 			"rank":      1,
 		},
@@ -150,7 +150,7 @@ func TestMySQLIdenticalItemProjectionAndLabelPatchArePersistentNoOps(t *testing.
 	// Map order and equivalent JSON number types produce the same canonical SQL projection.
 	identical := item
 	identical.Labels = map[string]any{
-		"rank": json.Number("1"), "keep": "yes", "embedding": []any{json.Number("0.25"), json.Number("0.5")},
+		"rank": json.Number("1"), "keep": "yes", "embedding": []any{json.Number("0.25"), json.Number("0.5"), json.Number("1e-7"), json.Number("-1e-8")},
 	}
 	require.Equal(t, float64(1), counterDelta(t, data.ItemProjectionCommitsTotal, data.ItemProjectionBranchUnchanged, func() {
 		require.NoError(t, modern.BatchInsertItems(ctx, []data.Item{identical}))
@@ -165,7 +165,7 @@ func TestMySQLIdenticalItemProjectionAndLabelPatchArePersistentNoOps(t *testing.
 	patcher := modern.(data.AtomicItemLabelPatcher)
 	require.Equal(t, float64(1), counterDelta(t, data.ItemLabelPatchCommitsTotal, "unchanged", func() {
 		_, handled, err := patcher.PatchItemLabelsAtomic(ctx, item.ItemId,
-			map[string]any{"embedding": []float64{0.25, 0.5}}, func(data.Item) error { return nil })
+			map[string]any{"embedding": []float64{0.25, 0.5, 1e-7, -1e-8}}, func(data.Item) error { return nil })
 		require.True(t, handled)
 		require.NoError(t, err)
 	}))

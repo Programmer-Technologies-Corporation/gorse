@@ -114,6 +114,50 @@ func (suite *ServerTestSuite) TestMySQLTwitchProjectionKeepsPatchedVectorInIndex
 	suite.Equal([]float32{0, 1}, indexed[0].Values)
 }
 
+func (suite *ServerTestSuite) TestMySQLYouTubeCountProjectionKeepsRecommendationsAndHealsIndex() {
+	uri := os.Getenv("TWITCH_COUNT_MYSQL_URI")
+	if uri == "" {
+		suite.T().Skip("TWITCH_COUNT_MYSQL_URI is not set")
+	}
+	original := suite.DataClient
+	db, err := data.Open(uri, fmt.Sprintf("api_yt_%d_", time.Now().UnixNano()),
+		storage.WithIsolationLevel("READ-COMMITTED"), storage.WithSeparateTwitchViewCounts(true))
+	suite.Require().NoError(err)
+	suite.Require().NoError(db.Init())
+	suite.DataClient = db
+	defer func() { suite.DataClient = original; suite.NoError(db.Purge()); suite.NoError(db.Close()) }()
+	suite.enableIncrementalItemToItem()
+	suite.Config.VideoHub.LabelPatch = true
+	items := []Item{
+		{ItemId: "source", Timestamp: "2026-10-04T12:00:00Z", Labels: map[string]any{"platform": "youtube", "externalKind": "Video", "viewCount": 1000, "embedding": []float64{0, 0}}},
+		{ItemId: "near", Timestamp: "2026-10-04T12:00:00Z", Labels: map[string]any{"platform": "youtube", "externalKind": "Video", "viewCount": 1000, "embedding": []float64{.1, 0}}},
+	}
+	project := func() {
+		apitest.New().Handler(suite.handler).Post("/api/items").Header("X-API-Key", apiKey).JSON(items).Expect(suite.T()).Status(http.StatusOK).End()
+	}
+	project()
+	suite.Equal([]string{"near"}, suite.neighborIds("/api/item/source/neighbors"))
+	items[0].Labels.(map[string]any)["viewCount"] = 2000
+	project()
+	stored, err := db.GetItem(suite.T().Context(), "source")
+	suite.Require().NoError(err)
+	suite.Equal(float64(2000), stored.Labels.(map[string]any)["viewCount"])
+	suite.Equal([]string{"near"}, suite.neighborIds("/api/item/source/neighbors"))
+	// A persistent no-op still repairs derived vectors after their loss.
+	suite.NoError(suite.VectorClient.DeleteVectors(suite.T().Context(), vectors.ItemToItemCollection("neighbors"), time.Now().Add(time.Minute)))
+	project()
+	suite.Equal([]string{"near"}, suite.neighborIds("/api/item/source/neighbors"))
+	apitest.New().Handler(suite.handler).Patch("/api/item/source/labels").Header("X-API-Key", apiKey).
+		JSON(map[string]any{"embedding": []float64{1, 0}}).Expect(suite.T()).Status(http.StatusOK).End()
+	stored, err = db.GetItem(suite.T().Context(), "source")
+	suite.Require().NoError(err)
+	suite.Equal(float64(2000), stored.Labels.(map[string]any)["viewCount"])
+	indexed, err := suite.VectorClient.GetVectors(suite.T().Context(), vectors.ItemToItemCollection("neighbors"), []string{"source"})
+	suite.Require().NoError(err)
+	suite.Require().Len(indexed, 1)
+	suite.Equal([]float32{1, 0}, indexed[0].Values)
+}
+
 func (suite *ServerTestSuite) TestTwitchProjectionRefreshSurvivesRequestCancellation() {
 	suite.enableIncrementalItemToItem()
 	original := suite.DataClient
