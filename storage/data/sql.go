@@ -1031,6 +1031,9 @@ func (d *SQLDatabase) BatchGetItems(ctx context.Context, itemIds []string, opts 
 		}
 		items = append(items, item)
 	}
+	if err = result.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	return items, nil
 }
 
